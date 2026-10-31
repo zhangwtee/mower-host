@@ -15,7 +15,7 @@
 
 底盘是 STM32F407 加一块驱动板，雷达用 RPLidar C1，USB 转串口那颗芯片是 CH340，设备 ID `1a86:55d4`。
 
-软件要装 ROS2 Humble，另外装 `robot_localization`，`/odom_combined` 和 TF 由它出。要建图导航再装 `slam_toolbox` 或 Nav2。
+软件要装 ROS 2 Jazzy，另外装 `robot_localization`，`/odom_combined` 和 TF 由它出。要建图导航再装 `slam_toolbox` 或 Nav2。
 
 ## 目录结构
 
@@ -37,7 +37,7 @@
 
 ```bash
 bash setup.sh                                   # 依赖 + udev 别名 + 桌面图标
-source /opt/ros/humble/setup.bash
+source /opt/ros/jazzy/setup.bash
 cd bridge && colcon build                       # 桥要单独编一次
 ```
 
@@ -46,7 +46,7 @@ cd bridge && colcon build                       # 桥要单独编一次
 ## 运行
 
 ```bash
-source /opt/ros/humble/setup.bash
+source /opt/ros/jazzy/setup.bash
 source bridge/install/setup.bash
 ros2 launch mower_bridge chassis_bridge.launch.py     # 终端 1
 python3 main.py                                        # 终端 2
