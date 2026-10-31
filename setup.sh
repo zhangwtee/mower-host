@@ -36,6 +36,27 @@ echo "[3/4] 检测设备..."
 [ -e /dev/mower_chassis ] && echo "底盘: /dev/mower_chassis ✔" || echo "底盘: 未检测到 —— 桥会起不来"
 [ -e /dev/mower_lidar ] && echo "雷达: /dev/mower_lidar ✔" || echo "雷达: 未检测到"
 
+# 3.5 地图保存目录：map_saver_cli 不会自动创建父目录，缺失会导致存盘失败
+mkdir -p "$HOME/mower_maps"
+
+# 3.6 雷达官方源码包：Slamtec rplidar_ros 2.1.4（ros2 分支）。
+# apt 仓库 2.1.0 是老移植版（仅 A1/A2/A3/S1、无可执行 rplidar_node、无电机服务），不支持 C1，不走 apt。
+# 已克隆/已编译则跳过；GitHub 直连受网络限制时回退 gh-proxy 镜像。
+echo "[3.6/4] 检查雷达官方源码包..."
+source /opt/ros/jazzy/setup.bash
+LIDAR_SRC="$HOME/mower_ws/src/rplidar_ros"
+mkdir -p "$HOME/mower_ws/src"
+if [ ! -d "$LIDAR_SRC" ]; then
+    if ! git clone -b ros2 --depth 1 https://github.com/Slamtec/rplidar_ros.git "$LIDAR_SRC" 2>/dev/null; then
+        echo "GitHub 直连失败，回退 gh-proxy 镜像..."
+        git clone -b ros2 --depth 1 https://gh-proxy.com/https://github.com/Slamtec/rplidar_ros.git "$LIDAR_SRC"
+    fi
+fi
+if [ ! -d "$HOME/mower_ws/install/rplidar_ros" ]; then
+    cd "$HOME/mower_ws"
+    colcon --log-base log build --packages-select rplidar_ros
+fi
+
 # 4. 桌面图标
 # 原来写死 /home/$USER/robot_ui，目录实际叫 mower-host —— 那个图标一直是坏的。
 # 桌面目录按 xdg-user-dir 取：中文 locale 的 Ubuntu 上它叫 ~/桌面，写死 ~/Desktop 会落进一个不存在的目录。
@@ -45,10 +66,10 @@ mkdir -p "$DESKTOP_DIR"
 cat > "$DESKTOP_DIR/割草机控制面板.sh" << DESK
 #!/bin/bash
 export DISPLAY=:0
-# 必须 source ROS：main_window.py 的 ROS_SETUP 只 source 工作空间，从不 source 发行版，
-# 少了这两句所有 ros2/rviz2 子进程都是 command not found，而界面一声不吭。
-source /opt/ros/humble/setup.bash
-[ -f "$HERE/bridge/install/setup.bash" ] && source "$HERE/bridge/install/setup.bash"
+# 三层 overlay：jazzy 底层 → mower_ws 自研三包 → bridge 通信桥；缺层条件跳过不打断链
+[ -f /opt/ros/jazzy/setup.bash ] && source /opt/ros/jazzy/setup.bash || true
+[ -f "$HOME/mower_ws/install/setup.bash" ] && source "$HOME/mower_ws/install/setup.bash" || true
+[ -f "$HERE/bridge/install/setup.bash" ] && source "$HERE/bridge/install/setup.bash" || true
 cd "$HERE"
 python3 main.py
 DESK
@@ -57,5 +78,7 @@ chmod +x "$DESKTOP_DIR/割草机控制面板.sh"
 echo "=== 配置完成 ==="
 echo
 echo "底盘桥要单独 colcon build 一次（之后只有改桥的代码才需要重来）："
-echo "  source /opt/ros/humble/setup.bash"
+echo "  source /opt/ros/jazzy/setup.bash"
 echo "  cd $HERE/bridge && colcon build"
+echo "自研三包与雷达包首次已随 setup.sh 编译；改源码后手动重编："
+echo "  source /opt/ros/jazzy/setup.bash && cd $HOME/mower_ws && colcon --log-base log build --packages-select mower_bringup mower_slam mower_nav2 rplidar_ros"

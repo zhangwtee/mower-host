@@ -1,6 +1,4 @@
-import cv2, json, os, glob, datetime
-from ui.waveform_widget import WaveformWidget
-from ui.mapping_widget import MappingWidget
+import json, os, glob, datetime
 import numpy as np
 import pyqtgraph as pg
 from collections import deque
@@ -9,9 +7,10 @@ from PyQt5.QtWidgets import (
     QStackedLayout, QSpacerItem, QSizePolicy, QButtonGroup, QRadioButton,
     QMessageBox, QListWidget, QListWidgetItem, QAbstractItemView
 )
-from PyQt5.QtCore import Qt, QTimer, QFileInfo
-from PyQt5.QtGui import QTextCursor, QImage
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QTextCursor
 from ui.camera_widget import CameraWidget
+from core.config import TEST_MODE
 from ui.speed_gauge import SpeedGauge
 
 CONFIG_FILE = os.path.expanduser("~/.割草机_config.json")
@@ -19,39 +18,41 @@ VIDEO_DIR = os.path.expanduser("~/Videos/割草机")
 
 # 树莓派上的绝对路径，全写在这一次。地图由建图时的 map_saver_cli 写进 MAP_DIR，
 # 导航和地图库都从这儿扫；换机器只改这三行。
-ROS_WS = "/home/zhangruodong/ROS2"
-MAP_DIR = "/home/zhangruodong"
-RVIZ_CFG = ROS_WS + "/src/robot_nav2/rviz/mower.rviz"
+ROS_WS = os.path.expanduser("~/mower_ws")
+MAP_DIR = os.path.expanduser("~/mower_maps")
+RVIZ_CFG = ROS_WS + "/src/mower_nav2/rviz/mower.rviz"
+# Mock 方案独立目录（不进 mower-host 仓库）：Mock 模式按钮拉起这套脚本
+MOCK_RVIZ_DIR = os.path.expanduser("~/Desktop/mock_rviz/mock")
+MOCK_LAUNCH_SH = MOCK_RVIZ_DIR + "/launch_mock_rviz.sh"
+MOCK_STOP_SH = MOCK_RVIZ_DIR + "/stop_mock_rviz.sh"
 
 
 class MainWindow(QWidget):
 
-    # 手动控制速度。固件收 mm/s（uartx_callback.c 里 XYZ_Target_Speed_transition），
-    # 这两个值远低于底盘上限，先用着安全。
-    MANUAL_V = 0.4      # m/s
-    MANUAL_W = 0.9      # rad/s
+    save_done = pyqtSignal(bool, str, str)
 
     def __init__(self, serial_mgr, protocol, dock_ctrl):
         super().__init__()
+        self.save_done.connect(self._on_save_done)
         self.serial_mgr = serial_mgr
         self.proto = protocol
         self.dock = dock_ctrl
         self._follow_on = False
-        self._follow_node = None
         self.camera_widget = None
         self.camera_window = None
-        self._mapping_widget = None
+        self._mapping = False
+        self._nav_on = False
+        self._map_saved = False
+        self._pending_stop_after_save = False
+        self._saving = False
+        self._bridge_proc = None
+        self._bringup_proc = None
+        self._mock_proc = None
+        self._mock_watch = None
         self._speed_left = 0.0
         self._speed_right = 0.0
-        self._manual_vx = 0.0
-        self._manual_vz = 0.0
-        self._keys_down = set()
         self.config = self._load_config()
         self.init_ui()
-        # 手动控制：按住才发、松手归零，页面切走也归零
-        self.setFocusPolicy(Qt.StrongFocus)
-        self._manual_timer = QTimer(); self._manual_timer.timeout.connect(self._manual_tick)
-        self.stack_layout.currentChanged.connect(self._on_page_changed)
         self._rec_vx_buf = deque(maxlen=120); self._rec_vz_buf = deque(maxlen=120); self._rec_b_buf = deque(maxlen=120)
         self.serial_mgr.sensor_updated.connect(
             lambda l, r, batt, servo: (self._waveform.update_values(l, r, batt, servo),
@@ -59,14 +60,17 @@ class MainWindow(QWidget):
                                        self._rec_b_buf.append(batt),
                                        setattr(self, '_rec_servo', servo),
                                        self._set_rec_values(l, r, batt),
-                                       self._push_sensor_to_camera(l, r, batt),
-                                       self._feed_mapping(l, r))
+                                       self._push_sensor_to_camera(l, r, batt))
         )
         self._rec_timer = QTimer(); self._rec_timer.timeout.connect(self._flush_rec_plot); self._rec_timer.start(200)
         self.dock.on_tag_found = self._on_tag_found
         self.dock.on_done = self._on_dock_done
         self._status_timer = QTimer(); self._status_timer.timeout.connect(self._update_status); self._status_timer.start(2000)
         self._speed_timer = QTimer(); self._speed_timer.timeout.connect(self._update_speed); self._speed_timer.start(1000)
+
+        # v3 进程模型：真机启动即拉底盘桥常驻；底层组(bringup)首次进叠加层前懒加载
+        if not TEST_MODE:
+            self._start_bridge()
 
     def _load_config(self):
         d = {"hw_mode": 0, "servo": True, "ultrasonic": False}
@@ -87,8 +91,6 @@ class MainWindow(QWidget):
         self.layout().setContentsMargins(11,11,11,11); self.setWindowTitle("割草机 控制面板"); self.stack_layout.setCurrentWidget(self.main_widget)
     def show_cache_page(self):
         self.setWindowTitle("清除缓存"); self.stack_layout.setCurrentWidget(self.cache_widget)
-    def show_manual(self):
-        self.setWindowTitle("手动控制"); self.stack_layout.setCurrentWidget(self.manual_widget)
     def show_video_page(self):
         self.setWindowTitle("视频管理"); self._refresh_video_list(); self.stack_layout.setCurrentWidget(self.video_widget)
     def show_speed_menu(self):
@@ -110,11 +112,6 @@ class MainWindow(QWidget):
         cw = getattr(self, 'camera_widget', None)
         if cw and hasattr(cw, 'set_sensor_data'):
             cw.set_sensor_data(vl, vr, batt)
-
-    def _feed_mapping(self, vl, vr):
-        """传感器速度推送给建图窗口"""
-        if self._mapping_widget and getattr(self, '_mapping', False):
-            self._mapping_widget.feed_speed(vl, vr)
 
     def _set_rec_values(self, vl, vr, batt):
         """传感器回调: 直接更新文字数值"""
@@ -142,31 +139,66 @@ class MainWindow(QWidget):
                 lay.addWidget(self.rec_camera, 1)
 
     def init_ui(self):
+        # fit_tuned 2026-10-26：为 1024x600 面板压缩主页面最小高度 ~70px
         self.resize(1000, 500)
         self.setWindowTitle("割草机 控制面板")
         self.stack_layout = QStackedLayout()
         self.setLayout(self.stack_layout)
 
-        self.main_widget = QWidget(); main_layout = QHBoxLayout(); self.main_widget.setLayout(main_layout)
+        self.main_widget = QWidget()
+        main_layout = QVBoxLayout()  # 改成垂直布局，上面状态栏，下面三栏
+        self.main_widget.setLayout(main_layout)
+        
+        # 顶部状态栏：状态指示灯
+        status_bar = QHBoxLayout()
+        status_bar.addWidget(QLabel("系统状态:"))
+        
+        self.led_chassis = QLabel("● 底盘")
+        self.led_chassis.setStyleSheet("color: #888; font-size: 14px;")
+        status_bar.addWidget(self.led_chassis)
+        
+        self.led_lidar = QLabel("● 雷达")
+        self.led_lidar.setStyleSheet("color: #888; font-size: 14px;")
+        status_bar.addWidget(self.led_lidar)
+        
+        self.led_ekf = QLabel("● EKF")
+        self.led_ekf.setStyleSheet("color: #888; font-size: 14px;")
+        status_bar.addWidget(self.led_ekf)
+        
+        self.led_slam = QLabel("● 建图")
+        self.led_slam.setStyleSheet("color: #888; font-size: 14px;")
+        status_bar.addWidget(self.led_slam)
+        
+        self.led_nav = QLabel("● 导航")
+        self.led_nav.setStyleSheet("color: #888; font-size: 14px;")
+        status_bar.addWidget(self.led_nav)
+        
+        status_bar.addStretch()
+        main_layout.addLayout(status_bar)
+        
+        # 下面三栏布局
+        content_layout = QHBoxLayout()
         left_layout = QVBoxLayout(); left_layout.setAlignment(Qt.AlignTop)
 
-        self.status_label = QLabel("状态:\n就绪"); self.status_label.setAlignment(Qt.AlignCenter); self.status_label.setStyleSheet("font-size:32px; font-weight:bold;")
-        left_layout.addSpacerItem(QSpacerItem(20, 40, QSizePolicy.Minimum, QSizePolicy.Fixed)); left_layout.addWidget(self.status_label); left_layout.addStretch()
+        self.status_label = QLabel("状态:\n就绪"); self.status_label.setAlignment(Qt.AlignCenter); self.status_label.setStyleSheet("font-size:26px; font-weight:bold;")
+        left_layout.addSpacerItem(QSpacerItem(20, 16, QSizePolicy.Minimum, QSizePolicy.Fixed)); left_layout.addWidget(self.status_label); left_layout.addStretch()
 
-        self.btn_selftest = QPushButton("整机自检"); self.btn_mow = QPushButton("开始割草"); self.btn_follow = QPushButton("雷达跟随"); self.btn_dock = QPushButton("自动回充"); self.btn_manual = QPushButton("手动控制"); self.btn_stop = QPushButton("紧急停止"); self.btn_release = QPushButton("解除急停")
-        for btn in [self.btn_selftest, self.btn_mow, self.btn_follow, self.btn_dock, self.btn_manual, self.btn_stop, self.btn_release]:
-            btn.setMinimumHeight(40); btn.setStyleSheet("font-size:20px;"); left_layout.addWidget(btn)
+        self.btn_selftest = QPushButton("整机自检"); self.btn_mow = QPushButton("开始割草"); self.btn_follow = QPushButton("雷达跟随"); self.btn_dock = QPushButton("自动回充"); self.btn_stop = QPushButton("紧急停止"); self.btn_release = QPushButton("解除急停"); self.btn_release.setEnabled(False)
+        for btn in [self.btn_selftest, self.btn_mow, self.btn_follow, self.btn_dock, self.btn_stop, self.btn_release]:
+            btn.setMinimumHeight(36); btn.setStyleSheet("font-size:20px;"); left_layout.addWidget(btn)
         # 急停是锁存的（固件 uartx_callback.c:138），不解就是复位前一直停着 ——
         # 所以解除必须是主界面上一个够显眼的按钮，不能藏进菜单。
         self.btn_release.setStyleSheet("font-size:20px; background-color:#1e6b3b; color:white;")
-        self.btn_selftest.clicked.connect(self.start_self_test); self.btn_mow.clicked.connect(self.start_mow); self.btn_follow.clicked.connect(self.toggle_follow); self.btn_dock.clicked.connect(self.start_dock); self.btn_manual.clicked.connect(self.show_manual); self.btn_stop.clicked.connect(self.stop_all); self.btn_release.clicked.connect(self.release_estop)
+        self.btn_stop.setStyleSheet("font-size:20px; font-weight:bold; background-color:#c0392b; color:white;")
+        self.btn_selftest.clicked.connect(self.start_self_test); self.btn_mow.clicked.connect(self.start_mow); self.btn_follow.clicked.connect(self.toggle_follow); self.btn_dock.clicked.connect(self.start_dock); self.btn_stop.clicked.connect(self.stop_all); self.btn_release.clicked.connect(self.release_estop)
 
-        self.btn_record = QPushButton("SLAM地图"); self.btn_record.setMinimumHeight(40); self.btn_record.setStyleSheet("font-size:20px;"); self.btn_record.clicked.connect(self.show_slam_page); left_layout.addWidget(self.btn_record)
-        self.btn_settings = QPushButton("设置"); self.btn_settings.setMinimumHeight(40); self.btn_settings.setStyleSheet("font-size:20px;"); self.btn_settings.clicked.connect(self.show_settings); left_layout.addWidget(self.btn_settings)
-        main_layout.addLayout(left_layout, 1)
+        self.btn_record = QPushButton("SLAM地图"); self.btn_record.setMinimumHeight(36); self.btn_record.setStyleSheet("font-size:20px;"); self.btn_record.clicked.connect(self.show_slam_page); left_layout.addWidget(self.btn_record)
+        self.btn_settings = QPushButton("设置"); self.btn_settings.setMinimumHeight(36); self.btn_settings.setStyleSheet("font-size:20px;"); self.btn_settings.clicked.connect(self.show_settings); left_layout.addWidget(self.btn_settings)
+        content_layout.addLayout(left_layout, 1)
 
-        center_layout = QVBoxLayout(); center_layout.addWidget(QLabel("发送日志")); self.send_log = QTextEdit(); self.send_log.setReadOnly(True); self.send_log.document().setMaximumBlockCount(500); center_layout.addWidget(self.send_log, stretch=1); self.btn_clear_send = QPushButton("清空发送日志"); self.btn_clear_send.clicked.connect(self.clear_send_log); center_layout.addWidget(self.btn_clear_send); main_layout.addLayout(center_layout, 1)
-        right_layout = QVBoxLayout(); right_layout.addWidget(QLabel("接收日志")); self.recv_log = QTextEdit(); self.recv_log.setReadOnly(True); self.recv_log.document().setMaximumBlockCount(500); right_layout.addWidget(self.recv_log, stretch=1); self.btn_clear_recv = QPushButton("清空接收日志"); self.btn_clear_recv.clicked.connect(self.clear_recv_log); right_layout.addWidget(self.btn_clear_recv); main_layout.addLayout(right_layout, 1)
+        center_layout = QVBoxLayout(); center_layout.addWidget(QLabel("发送日志")); self.send_log = QTextEdit(); self.send_log.setReadOnly(True); self.send_log.document().setMaximumBlockCount(500); center_layout.addWidget(self.send_log, stretch=1); self.btn_clear_send = QPushButton("清空发送日志"); self.btn_clear_send.clicked.connect(self.clear_send_log); center_layout.addWidget(self.btn_clear_send); content_layout.addLayout(center_layout, 1)
+        right_layout = QVBoxLayout(); right_layout.addWidget(QLabel("接收日志")); self.recv_log = QTextEdit(); self.recv_log.setReadOnly(True); self.recv_log.document().setMaximumBlockCount(500); right_layout.addWidget(self.recv_log, stretch=1); self.btn_clear_recv = QPushButton("清空接收日志"); self.btn_clear_recv.clicked.connect(self.clear_recv_log); right_layout.addWidget(self.btn_clear_recv); content_layout.addLayout(right_layout, 1)
+        main_layout.addLayout(content_layout)
         self.stack_layout.addWidget(self.main_widget)
 
         self.settings_widget = self._page("设置", [
@@ -247,43 +279,14 @@ class MainWindow(QWidget):
         self._btn_nav.setStyleSheet("font-size:20px;background-color:#e67e22;color:white;")
         self._btn_nav.clicked.connect(self.start_nav); sl2.addWidget(self._btn_nav)
         sl2.addSpacing(8)
-        self._btn_stop_slam = QPushButton("停止建图"); self._btn_stop_slam.setMinimumHeight(45)
-        self._btn_stop_slam.setStyleSheet("font-size:20px;background-color:#8b0000;color:white;")
-        self._btn_stop_slam.clicked.connect(self._stop_slam); sl2.addWidget(self._btn_stop_slam)
-        sl2.addSpacing(8)
         self._btn_map_gallery = QPushButton("地图库"); self._btn_map_gallery.setMinimumHeight(45)
         self._btn_map_gallery.setStyleSheet("font-size:20px;background-color:#1565c0;color:white;")
         self._btn_map_gallery.clicked.connect(self.show_map_gallery); sl2.addWidget(self._btn_map_gallery)
+        self._map_container = QVBoxLayout()
+        sl2.addLayout(self._map_container, stretch=1)
         sl2.addStretch()
         bb2 = QPushButton("返回主界面"); bb2.setMinimumHeight(40); bb2.clicked.connect(self.show_main); sl2.addWidget(bb2)
         self.stack_layout.addWidget(self.slam_widget)
-        # ---- 手动控制 ----
-        self.manual_widget = QWidget(); ml = QVBoxLayout(); self.manual_widget.setLayout(ml)
-        mt = QLabel("手动控制"); mt.setAlignment(Qt.AlignCenter); mt.setStyleSheet("font-size:32px; font-weight:bold;")
-        ml.addWidget(mt)
-        mh = QLabel("按住 ↑↓←→ 或 WASD 驱动，松手停车。\n"
-                    "Nav2 在跑时别用手动 —— 两边都往 /cmd_vel 发。")
-        mh.setAlignment(Qt.AlignCenter); mh.setStyleSheet("font-size:14px; color:#888;"); ml.addWidget(mh)
-        ml.addSpacing(20)
-
-        def _mbtn(text, vx, vz):
-            # NoFocus 是关键：否则点完按钮焦点留在按钮上，方向键会变成在按钮间挪焦点
-            b = QPushButton(text); b.setMinimumSize(80, 60)
-            b.setStyleSheet("font-size:24px;"); b.setFocusPolicy(Qt.NoFocus)
-            b.pressed.connect(lambda: self._manual_set(vx, vz))
-            b.released.connect(lambda: self._manual_set(0.0, 0.0))
-            return b
-
-        r1 = QHBoxLayout(); r1.addStretch(); r1.addWidget(_mbtn("↑", self.MANUAL_V, 0.0)); r1.addStretch(); ml.addLayout(r1)
-        r2 = QHBoxLayout(); r2.addStretch()
-        for w in (_mbtn("←", 0.0, self.MANUAL_W), _mbtn("停", 0.0, 0.0), _mbtn("→", 0.0, -self.MANUAL_W)):
-            r2.addWidget(w)
-        r2.addStretch(); ml.addLayout(r2)
-        r3 = QHBoxLayout(); r3.addStretch(); r3.addWidget(_mbtn("↓", -self.MANUAL_V, 0.0)); r3.addStretch(); ml.addLayout(r3)
-        ml.addSpacing(20)
-        mbb = QPushButton("← 返回主界面"); mbb.setMinimumHeight(40); mbb.clicked.connect(self.show_main); ml.addWidget(mbb)
-        self.stack_layout.addWidget(self.manual_widget)
-
         self.map_gallery_widget = QWidget(); self.map_gallery_widget.setLayout(QVBoxLayout())
         self.stack_layout.addWidget(self.map_gallery_widget)
 
@@ -436,28 +439,58 @@ class MainWindow(QWidget):
 
     def _on_camera_window_close(self, event): self._release_camera(); event.accept()
     def closeEvent(self, event):
-        self._lidar_running = False
+        self._abort_prepare()
+        if TEST_MODE and getattr(self, '_mapping', False):
+            self._stop_mock_mapping()
+        self._pending_stop_after_save = False; self._saving = False
         self._release_camera()
         if hasattr(self, 'rec_camera') and self.rec_camera: self.rec_camera.stop_recording(); self.rec_camera.stop_camera()
         import subprocess
         subprocess.run(
             ["bash", "-c",
-             self.ROS_SETUP + " && timeout 3 ros2 service call /stop_motor std_srvs/srv/Empty '{}' 2>/dev/null"],
+             self.ROS_SETUP + " && timeout 3 ros2 service call /stop_motor std_srvs/srv/Empty '{}' >/dev/null 2>&1"],
             env=dict(os.environ, DISPLAY=":0"))
-        subprocess.run(["pkill", "-f", "slam_toolbox|slam_gmapping|cartographer_node|rplidar|lslidar|x10|rviz2|lasertracker|laserfollower|base_to_laser|static_transform|nav2_bringup"])
-        # 停串口节点，释放串口，防止下次启动崩溃
-        subprocess.run(["pkill", "-f", "chassis_bridge"])
+
+        # 先优雅结束本进程亲手拉起的子进程，再交给 pkill 兜底（句柄自己维护的不靠模式匹配）
+        for _attr in ("_lidar_proc", "_bringup_proc", "_bridge_proc"):
+            _p = getattr(self, _attr, None)
+            try:
+                if _p is not None and _p.poll() is None:
+                    _p.terminate()
+            except Exception:
+                pass
+        # v3 分层清理：叠加层（slam / Nav2 / rviz2 / 看图 map_server）→ 底层组（bringup/EKF/静态 TF/雷达）→ 桥
+        # 1. 叠加层
+        subprocess.run(["pkill", "-f",
+                        "async_slam_toolbox_node|sync_slam_toolbox_node|mapper_online_async.launch.py|mapper_online_sync.launch.py|"
+                        "bringup_launch.py|nav2_container|component_container_isolated|"
+                        "controller_server|planner_server|bt_navigator|behavior_server|"
+                        "smoother_server|waypoint_follower|amcl|map_server|lifecycle_manager_navigation|"
+                        "rviz2"])
+        # 2. 底层组（EKF + 静态 TF + 雷达预留）
+        subprocess.run(["pkill", "-f",
+                        "mower_bringup.launch.py|ekf_filter_node|ekf_node|"
+                        "static_transform_publisher|base_to_|rplidar_node"])
+        # 3. 底盘桥
+        subprocess.run(["pkill", "-f", "chassis_bridge.launch.py|chassis_bridge"])
+        # 刷新陈旧节点图缓存
+        subprocess.run(["bash", "-c", self.ROS_SETUP + " && ros2 daemon stop >/dev/null 2>&1"],
+                       env=dict(os.environ, DISPLAY=":0"))
         self.serial_mgr.close(); event.accept()
 
     # ============ 录屏（预览窗 + OpenCV 录像，Docker 兼容） ============
     def _start_grab_record(self, label):
         if getattr(self, '_grab_writer', None): return
         import cv2
+        os.makedirs(VIDEO_DIR, exist_ok=True)
 
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         path = os.path.join(VIDEO_DIR, f"{label}_{ts}.avi")
         fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-        self._grab_writer = cv2.VideoWriter(path, fourcc, 15.0, (960, 480))
+        self._grab_writer = cv2.VideoWriter(path, cv2.CAP_FFMPEG, fourcc, 15.0, (960, 480))
+        if not self._grab_writer.isOpened():
+            # FFMPEG 失败则回退默认后端再试一次
+            self._grab_writer = cv2.VideoWriter(path, fourcc, 15.0, (960, 480))
         if not self._grab_writer.isOpened():
             self._grab_writer = None; return
 
@@ -628,153 +661,443 @@ class MainWindow(QWidget):
             self.status_label.setText("状态:\n就绪")
             self.serial_mgr.send(self.proto.build_emergency_frame())
 
-    ROS_SETUP = "source " + ROS_WS + "/install/setup.bash"
-
     # 我们自己的底盘桥，整个替掉了原来的底盘节点。
     # 路径按本文件位置推，换机器/换克隆目录都不用改。
-    BRIDGE_SETUP = (ROS_SETUP + " && source "
-                    + os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                   "bridge", "install", "setup.bash"))
+    _bridge_setup_bash = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                      "bridge", "install", "setup.bash")
+    # 三层 overlay：Jazzy 底层 → mower_ws 自研包 → 底盘桥；任一缺失条件跳过不打断链
+    JAZZY_SETUP = "[ -f /opt/ros/jazzy/setup.bash ] && source /opt/ros/jazzy/setup.bash || true"
+    ROS_SETUP = (JAZZY_SETUP + " && { [ -f " + ROS_WS + "/install/setup.bash ] && source "
+                 + ROS_WS + "/install/setup.bash || true; }")
+    BRIDGE_SETUP = (ROS_SETUP + " && { [ -f " + _bridge_setup_bash
+                    + " ] && source " + _bridge_setup_bash + " || true; }")
     BRIDGE_LAUNCH = "ros2 launch mower_bridge chassis_bridge.launch.py"
+    BRINGUP_LAUNCH = "ros2 launch mower_bringup mower_bringup.launch.py"
 
-    def start_mapping(self):
-        import subprocess, os, time
+    def _start_mock_mapping(self):
+        """Mock 模式：拉起独立 mock 节点 + 真实 rviz2（脚本位于 ~/Desktop/mock_rviz/mock/，不进本仓库）"""
+        import subprocess
+        if self._mapping:
+            self._request_stop_mapping()
+            return
+        if not os.path.isfile(MOCK_LAUNCH_SH):
+            self.log_send("建图: 未找到启动脚本 " + MOCK_LAUNCH_SH)
+            QMessageBox.warning(self, "Mock 建图", "未找到启动脚本：\n" + MOCK_LAUNCH_SH)
+            return
+        # 先清掉可能残留的上一轮 Mock 进程，防止重复拉起
+        if os.path.isfile(MOCK_STOP_SH):
+            subprocess.run(["bash", MOCK_STOP_SH],
+                           env=dict(os.environ, DISPLAY=":0"),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        self._mock_proc = subprocess.Popen(
+            ["bash", MOCK_LAUNCH_SH],
+            env=dict(os.environ, DISPLAY=":0"))
+        self._mapping = True
+        self._map_saved = False
+        self._pending_stop_after_save = False
+        self._saving = False
+        self._btn_start_slam.setText("停止建图")
+        self.status_label.setText("状态:\nMock 建图中")
+        self.log_send("建图: Mock rviz2 已启动（独立 mock 节点 + rviz2）")
+        self._start_mock_watch()
 
-        # --- 停止建图 ---
-        if getattr(self, '_mapping', False):
+    def _start_mock_watch(self):
+        """轮询后台 launch 进程，rviz 被手动关闭时同步复位 UI"""
+        if self._mock_watch is None:
+            self._mock_watch = QTimer(self)
+            self._mock_watch.setInterval(500)
+            self._mock_watch.timeout.connect(self._watch_mock_proc)
+        self._mock_watch.start()
+
+    def _watch_mock_proc(self):
+        if self._mock_proc is not None and self._mock_proc.poll() is not None:
+            self._mock_watch.stop()
+            self._mock_proc = None
             self._mapping = False
             self._btn_start_slam.setText("开始建图")
             self.status_label.setText("状态:\n就绪")
-            self.log_send("建图: 已停止")
-            subprocess.run(
-                ["bash", "-c",
-                 self.ROS_SETUP + " && timeout 3 ros2 service call /stop_motor std_srvs/srv/Empty '{}' 2>/dev/null"],
-                env=dict(os.environ, DISPLAY=":0"))
-            subprocess.run(["pkill", "-f", "slam_toolbox|slam_gmapping|cartographer_node|rplidar|lslidar|x10"])
-            subprocess.run(["pkill", "rviz2"])
-            time.sleep(2)
-            # 把底盘桥拉回来（建图停了，控制得回来）
-            subprocess.Popen(
-                ["bash", "-c",
-                 self.BRIDGE_SETUP + " && " + self.BRIDGE_LAUNCH],
-                env=dict(os.environ, DISPLAY=":0"))
+            self.log_send("建图: Mock rviz2 已退出")
+
+    def _stop_mock_mapping(self):
+        """Mock 模式：按 PID 文件停止 mock 节点与本方案 rviz2，不触碰真机进程"""
+        import subprocess
+        if self._mock_watch is not None:
+            self._mock_watch.stop()
+        if os.path.isfile(MOCK_STOP_SH):
+            try:
+                subprocess.run(["bash", MOCK_STOP_SH],
+                               env=dict(os.environ, DISPLAY=":0"),
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            except Exception as e:
+                self.log_send("建图: 停止脚本异常 " + str(e))
+        if self._mock_proc is not None:
+            try:
+                self._mock_proc.terminate()
+            except Exception:
+                pass
+            self._mock_proc = None
+        self._mapping = False
+        self._btn_start_slam.setText("开始建图")
+        self.status_label.setText("状态:\n就绪")
+        self.log_send("建图: Mock 已停止")
+
+    def _start_bridge(self):
+        """v3：底盘桥启动即拉、常驻在线；叠加层启停不重启本层。Mock 模式跳过。"""
+        import subprocess, os
+        self._bridge_proc = subprocess.Popen(
+            ["bash", "-c", self.BRIDGE_SETUP + " && " + self.BRIDGE_LAUNCH],
+            env=dict(os.environ, DISPLAY=":0"))
+
+    # ================= 非阻塞准备流程（QTimer 状态机） =================
+    # 拉起底层组/雷达要等就绪，但不能在 GUI 线程里 sleep 轮询（窗口会假死）。
+    # 这里改成每 500 ms 推进一次的状态机：界面始终可响应，超时明确提示。
+    def _topic_online(self, topic):
+        """话题是否有发布者。优先问本地 rclpy 节点（O(1)），失败再回退到 ros2 CLI。"""
+        fn = getattr(self.serial_mgr, "topic_online", None)
+        if callable(fn):
+            try:
+                return bool(fn(topic))
+            except Exception:
+                pass
+        import subprocess, os
+        probe = self.ROS_SETUP + " && ros2 topic list 2>/dev/null | grep -x " + topic
+        try:
+            return subprocess.run(["bash", "-c", probe], env=dict(os.environ, DISPLAY=":0"),
+                                  capture_output=True, text=True, timeout=5).returncode == 0
+        except Exception:
+            return False
+
+    def _ensure_bridge(self):
+        """确保底盘桥在跑：/odom 在线直接返回；已拉起且进程活着就等；否则重新拉起。
+
+        桥只在 UI 启动时拉一次，运行中若挂了（串口松动、进程被杀），
+        后续建图会一直卡在等 /odom_combined。这里补上"桥死了就重拉"。
+        """
+        if TEST_MODE or self._topic_online("/odom"):
+            return
+        p = getattr(self, "_bridge_proc", None)
+        if p is not None and p.poll() is None:
+            return          # 进程还活着，可能只是还没开始发数据，交给超时判断
+        self.log_send("底盘桥: 未在线，重新拉起")
+        self._start_bridge()
+
+    def _ensure_bringup(self):
+        """只拉起、不等待：/odom_combined 已在线则跳过。Mock 跳过。
+
+        已经拉起过且进程还活着就不再拉第二份——上一次准备超时后重试时，
+        若无此判断会叠出第二套 EKF / 静态 TF / robot_state_publisher。
+        """
+        if TEST_MODE or self._topic_online("/odom_combined"):
+            return
+        p = getattr(self, "_bringup_proc", None)
+        if p is not None and p.poll() is None:
+            return
+        import subprocess, os
+        self.log_send("底层组: 启动 bringup（EKF/静态 TF/URDF）")
+        self._bringup_proc = subprocess.Popen(
+            ["bash", "-c", self.ROS_SETUP + " && " + self.BRINGUP_LAUNCH],
+            env=dict(os.environ, DISPLAY=":0"))
+
+    def _ensure_lidar(self):
+        """只拉起、不等待：/scan 已在线则跳过。不整组带 use_lidar，避免复制第二套 EKF。"""
+        if TEST_MODE or self._topic_online("/scan"):
+            return
+        p = getattr(self, "_lidar_proc", None)
+        if p is not None and p.poll() is None:
+            return          # 已拉起且还活着：再开一个会抢同一个串口
+        import subprocess, os
+        params = ROS_WS + "/install/mower_bringup/share/mower_bringup/config/lidar_node_params.yaml"
+        self.log_send("激光雷达: 单起 rplidar_node")
+        self._lidar_proc = subprocess.Popen(
+            ["bash", "-c",
+             self.ROS_SETUP + " && ros2 run rplidar_ros rplidar_node --ros-args --params-file " + params],
+            env=dict(os.environ, DISPLAY=":0"))
+
+    def _prepare(self, steps, done):
+        """非阻塞准备：steps=[(阶段名, 就绪判定, 超时秒, 进入动作)]，done(ok) 回到 GUI 线程。
+
+        建图与导航共用这一条流水线：若上一次还没结束就再次触发，先取消上一次
+        （并恢复按钮），再把两个入口一起禁用，直到本次结束。
+        """
+        if getattr(self, "_prep_steps", None):
+            self.log_send("准备流程: 取消上一次未完成的启动")
+            self._abort_prepare()
+        for name in ("_btn_start_slam", "_btn_nav"):
+            b = getattr(self, name, None)
+            if b is not None:
+                try:
+                    b.setEnabled(False)
+                except Exception:
+                    pass
+        self._prep_steps = list(steps)
+        self._prep_done = done
+        self._prep_cur = None
+        if getattr(self, "_prep_timer", None) is None:
+            self._prep_timer = QTimer(self)
+            self._prep_timer.timeout.connect(self._prep_tick)
+        self._prep_timer.start(500)
+        self._prep_tick()
+
+    def _prep_tick(self):
+        import time
+        if not getattr(self, "_prep_steps", None):
+            self._prep_timer.stop()
+            cb, self._prep_done = self._prep_done, None
+            if cb:
+                cb(True)
+            return
+        name, cond, timeout, on_enter = self._prep_steps[0]
+        if self._prep_cur != name:
+            self._prep_cur = name
+            self._prep_t0 = time.monotonic()
+            self.log_send(name)
+            self.status_label.setText("状态:\n" + name)
+            if on_enter:
+                try:
+                    on_enter()
+                except Exception as e:
+                    self.log_send("准备失败: " + str(e))
+        try:
+            ready = bool(cond())
+        except Exception:
+            ready = False
+        if ready:
+            self._prep_steps.pop(0)
+            self._prep_cur = None
+            return
+        if time.monotonic() - self._prep_t0 > timeout:
+            self._prep_timer.stop()
+            self._prep_cur = None
+            self.log_send(name + ": 超时")
+            self.status_label.setText("状态:\n" + name + " 未就绪")
+            cb, self._prep_done = self._prep_done, None
+            if cb:
+                cb(False)
+
+    def _restore_start_buttons(self):
+        """把"开始建图 / Nav2 导航"恢复到可点。所有准备流程的出口都必须经过这里。"""
+        for name in ("_btn_start_slam", "_btn_nav"):
+            b = getattr(self, name, None)
+            if b is not None:
+                try:
+                    b.setEnabled(True)
+                except Exception:
+                    pass
+
+    def _abort_prepare(self):
+        """取消准备流程。必须把按钮恢复，否则急停打断后"开始建图"会一直灰着。"""
+        t = getattr(self, "_prep_timer", None)
+        if t is not None:
+            t.stop()
+        self._prep_steps = []
+        self._prep_done = None
+        self._prep_cur = None
+        self._restore_start_buttons()
+
+    def start_mapping(self):
+        if TEST_MODE:
+            self._start_mock_mapping()
+            return
+        # --- 停止建图（叠加层；底层组与桥常驻，不重启、不恢复） ---
+        if getattr(self, '_mapping', False):
+            self._request_stop_mapping()
             return
 
-        # --- 启动建图 ---
-        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QRadioButton, QDialogButtonBox, QButtonGroup
-        dlg = QDialog()
-        dlg.setWindowTitle("选择建图方式")
-        lay = QVBoxLayout()
-        dlg.setLayout(lay)
-        group = QButtonGroup(dlg)
-        opts = [
-            ("slam_toolbox",  "slam_toolbox (推荐, 异步)"),
-            ("gmapping",      "gmapping (粒子滤波)"),
-            ("cartographer",  "cartographer (图优化)"),
-        ]
-        radios = []
-        for val, label in opts:
-            r = QRadioButton(label)
-            lay.addWidget(r)
-            group.addButton(r)
-            r.val = val
-            radios.append(r)
-        radios[0].setChecked(True)
+        # 建图模式二选一（取消则不启动）
+        mode = self._choose_slam_mode()
+        if mode is None:
+            return
+        self._slam_mode = mode
+        self.log_send("建图模式: " + ("同步" if mode == "sync" else "异步"))
+
+        # 非阻塞准备：底层组 → 雷达，就绪后再拉叠加层（不在 GUI 线程 sleep）
+        self._prepare(
+            [("等待底盘桥 /odom",
+              lambda: self._topic_online("/odom"), 8, self._ensure_bridge),
+             ("等待底层组（EKF/静态 TF）",
+              lambda: self._topic_online("/odom_combined"), 12, self._ensure_bringup),
+             ("等待激光雷达 /scan",
+              lambda: self._topic_online("/scan"), 8, self._ensure_lidar)],
+            self._start_mapping_overlay)
+
+    def _choose_slam_mode(self):
+        """建图模式二选一：异步（默认）/ 同步。返回 'async' / 'sync'，取消返回 None。"""
+        from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QRadioButton,
+                                     QButtonGroup, QDialogButtonBox, QLabel)
+        d = QDialog(self)
+        d.setWindowTitle("选择建图模式")
+        lay = QVBoxLayout(); d.setLayout(lay)
+        lay.addWidget(QLabel("slam_toolbox 建图模式："))
+        rb_async = QRadioButton("异步（推荐）：建图与位姿解算分开跑，不丢帧，CPU 占用略高")
+        rb_sync = QRadioButton("同步：严格按帧顺序处理，慢但可复现，用于排查建图异常")
+        rb_async.setChecked(True)
+        g = QButtonGroup(d); g.addButton(rb_async); g.addButton(rb_sync)
+        lay.addWidget(rb_async); lay.addWidget(rb_sync)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bb.accepted.connect(dlg.accept)
-        bb.rejected.connect(dlg.reject)
+        bb.accepted.connect(d.accept); bb.rejected.connect(d.reject)
         lay.addWidget(bb)
-        if not dlg.exec_():
+        if not d.exec_():
+            return None
+        return "sync" if rb_sync.isChecked() else "async"
+
+    def _start_mapping_overlay(self, ok):
+        """准备完成回调（GUI 线程）：起 slam_toolbox + rviz2。"""
+        self._restore_start_buttons()
+        if not ok:
+            self.log_send("建图: 准备未完成，已取消（查日志：底层组或雷达未就绪）")
+            self.status_label.setText("状态:\n准备未完成")
             return
-
-        slam_choice = next(r.val for r in radios if r.isChecked())
-        self.log_send("建图: 启动 " + slam_choice)
-
-        # 这三个是树莓派工作空间里装好的包名，不是路径 —— 拼错一个建图就起不来。
-        launch_pkg = {
-            "slam_toolbox": "slam_toolbox online_async_launch.py",
-            "gmapping":     "slam_gmapping slam_gmapping.launch.py",
-            "cartographer": "cartographer_ros cartographer.launch.py",
-        }
-        rviz_cfg = RVIZ_CFG
-
-        # 1. 彻底清理旧进程，让 EKF 从零开始（避免残留影响建图质量）
-        subprocess.run(["pkill", "-f", "chassis_bridge|ekf_node|rplidar"])
-        time.sleep(2)
-
-        # 2. 启动建图（source 完整 overlay 环境）
+        import subprocess, os
+        mode = getattr(self, "_slam_mode", "async")
+        launch_file = ("mapper_online_sync.launch.py" if mode == "sync"
+                       else "mapper_online_async.launch.py")
         subprocess.Popen(
             ["bash", "-c",
-             self.ROS_SETUP + " && ros2 launch " + launch_pkg[slam_choice]],
+             self.ROS_SETUP + " && ros2 launch mower_slam " + launch_file],
             env=dict(os.environ, DISPLAY=":0"))
-
-        # 3. 启动 rviz2
         subprocess.Popen(
             ["bash", "-c",
-             self.ROS_SETUP + " && rviz2 -d " + rviz_cfg],
+             self.ROS_SETUP + " && rviz2 -d " + RVIZ_CFG],
             env=dict(os.environ, DISPLAY=":0"))
-
         self._mapping = True
+        self._map_saved = False
+        self._pending_stop_after_save = False
+        self._saving = False
         self._btn_start_slam.setText("停止建图")
-        self.status_label.setText("状态:\n建图中(" + slam_choice + ")")
-        self.log_send("建图: " + slam_choice + " 已启动")
+        self.status_label.setText("状态:\n建图中(slam_toolbox-%s)" % ("同步" if mode == "sync" else "异步"))
+        self.log_send("建图: slam_toolbox 已启动（%s）" % ("同步" if mode == "sync" else "异步"))
+
     def show_slam_page(self):
         self.setWindowTitle("SLAM 地图"); self.stack_layout.setCurrentWidget(self.slam_widget)
 
     def _save_map(self):
+        if not getattr(self, '_mapping', False):
+            self.log_send("保存地图: 当前未在建图，无地图可保存")
+            self.status_label.setText("状态:\n未在建图")
+            QMessageBox.warning(self, "保存地图", "请先开始建图，地图发布后再保存。")
+            return
+        if getattr(self, '_saving', False):
+            return
         from datetime import datetime
         import subprocess, os, threading
+        os.makedirs(MAP_DIR, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = os.path.join(MAP_DIR, "mymap_" + ts)
         self.log_send("保存地图: " + fname); self.status_label.setText("状态:\n保存地图中...")
         self._btn_save_map.setEnabled(False)
+        self._btn_start_slam.setEnabled(False)
+        self._saving = True
 
         def _run():
             try:
                 r = subprocess.run(
                     ["bash", "-c",
-                     self.ROS_SETUP + " && ros2 run nav2_map_server map_saver_cli -f " + fname],
+                     self.ROS_SETUP + " && ros2 run nav2_map_server map_saver_cli -f " + fname + " --ros-args -p map_subscribe_transient_local:=false -p save_map_timeout:=10.0"],
                     env=dict(os.environ, DISPLAY=":0"), capture_output=True, text=True, timeout=35)
-                err = r.stderr.strip() or r.stdout.strip()
+                raw = r.stderr.strip() or r.stdout.strip()
+                lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+                err_lines = [ln for ln in lines
+                             if "[ERROR]" in ln or "[WARN]" in ln
+                             or "failed" in ln.lower() or "error" in ln.lower()]
+                err = " / ".join(err_lines) or (lines[-1] if lines else "")
                 ok = r.returncode == 0 or os.path.exists(fname + ".pgm")
             except Exception as e:
                 err = str(e); ok = False
-            from PyQt5.QtCore import QTimer
-            QTimer.singleShot(0, lambda: self._on_save_done(ok, fname, err[:80] if err else ""))
+            self.save_done.emit(ok, fname, err[:160] if err else "")
 
         threading.Thread(target=_run, daemon=True).start()
 
     def _on_save_done(self, ok, fname, err):
         self._btn_save_map.setEnabled(True)
+        self._btn_start_slam.setEnabled(True)
+        self._saving = False
         if ok:
+            self._map_saved = True
             self.log_send("地图保存成功: " + fname); self.status_label.setText("状态:\n地图已保存")
         else:
             self.log_send("保存失败: " + (err or "未知错误"))
             self.status_label.setText("状态:\n保存失败")
+            if self._pending_stop_after_save:
+                box = QMessageBox(self)
+                box.setWindowTitle("停止建图")
+                box.setText("地图保存失败，仍要停止建图吗？")
+                b_yes = box.addButton("仍要停止", QMessageBox.AcceptRole)
+                box.addButton("继续建图", QMessageBox.RejectRole)
+                box.exec_()
+                self._pending_stop_after_save = False
+                if box.clickedButton() is b_yes:
+                    self._do_stop_mapping()
+                else:
+                    self.status_label.setText("状态:\n建图中")
+                return
+        if self._pending_stop_after_save:
+            self._pending_stop_after_save = False
+            self._do_stop_mapping()
+
+    def _request_stop_mapping(self):
+        """停止建图统一入口：本次会话未保存过先弹窗询问；保存过直接清理。"""
+        if self._map_saved:
+            self._do_stop_mapping()
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("停止建图")
+        box.setText("当前地图尚未保存，是否先保存再停止？")
+        b_save = box.addButton("保存并停止", QMessageBox.AcceptRole)
+        box.addButton("不保存，直接停止", QMessageBox.DestructiveRole)
+        b_cancel = box.addButton("取消", QMessageBox.RejectRole)
+        box.exec_()
+        if box.clickedButton() is b_cancel:
+            return
+        if box.clickedButton() is b_save:
+            self._pending_stop_after_save = True
+            self._save_map()
+            return
+        self._do_stop_mapping()
+
+    def _do_stop_mapping(self):
+        """执行实际停止清理：Mock/真机分发，动作口径对齐各自手动停止分支。"""
+        if TEST_MODE:
+            self._stop_mock_mapping()
+        else:
+            self._stop_mapping_real()
+
+    def _stop_mapping_real(self):
+        """真机停止建图清理（动作平移自 start_mapping 原停止分支）。"""
+        import subprocess
+        self._mapping = False
+        self._btn_start_slam.setText("开始建图")
+        self.status_label.setText("状态:\n就绪")
+        self.log_send("建图: 已停止")
+        subprocess.run(
+            ["bash", "-c",
+             self.ROS_SETUP + " && timeout 3 ros2 service call /stop_motor std_srvs/srv/Empty '{}' >/dev/null 2>&1"],
+            env=dict(os.environ, DISPLAY=":0"))
+        subprocess.run(["pkill", "-f", "async_slam_toolbox_node|sync_slam_toolbox_node|mapper_online_async.launch.py|mapper_online_sync.launch.py"])
+        subprocess.run(["pkill", "rviz2"])
 
     def start_nav(self):
         """Nav2 导航 — 点一下启动选地图，再点停止恢复控制"""
-        import subprocess, os, time, glob
+        if TEST_MODE:
+            self.log_send("导航: Mock 模式不支持 Nav2 导航")
+            QMessageBox.information(self, "Mock 模式", "当前为 Mock 环境（无硬件），Nav2 导航请在真机模式使用。")
+            return
+        import subprocess, os, glob
 
-        # --- 停止导航 ---
+        # --- 停止导航（叠加层；底层组与桥常驻，不重启、不恢复） ---
         if getattr(self, '_nav_on', False):
             self._nav_on = False
             self._btn_nav.setText("Nav2 导航")
             self.status_label.setText("状态:\n就绪")
             self.log_send("导航: 停止")
-            # 杀 Nav2 launch、rviz2、激光、停电机
-            subprocess.run(["pkill", "-f", "nav2_bringup"])
+            # 杀 Nav2 叠加层：launch 主进程 + composition 容器 + 独立节点兜底
+            subprocess.run(["pkill", "-f",
+                            "bringup_launch.py|nav2_container|component_container_isolated|"
+                            "controller_server|planner_server|bt_navigator|behavior_server|"
+                            "smoother_server|waypoint_follower|amcl|map_server|lifecycle_manager_navigation"])
             subprocess.run(["pkill", "rviz2"])
-            subprocess.run(["pkill", "-f", "rplidar|lslidar|x10"])
             subprocess.run(
                 ["bash", "-c",
-                 self.ROS_SETUP + " && timeout 3 ros2 service call /stop_motor std_srvs/srv/Empty '{}' 2>/dev/null"],
-                env=dict(os.environ, DISPLAY=":0"))
-            time.sleep(2)
-            # 恢复底盘控制
-            subprocess.Popen(
-                ["bash", "-c",
-                 self.BRIDGE_SETUP + " && " + self.BRIDGE_LAUNCH],
+                 self.ROS_SETUP + " && timeout 3 ros2 service call /stop_motor std_srvs/srv/Empty '{}' >/dev/null 2>&1"],
                 env=dict(os.environ, DISPLAY=":0"))
             return
 
@@ -803,56 +1126,67 @@ class MainWindow(QWidget):
         map_file = maps[lst.currentRow()]
         self.log_send("导航: 加载 " + os.path.basename(map_file))
 
-        # 停建图 + 旧进程
+        # 停建图叠加层（叠加层互斥；底层组与桥常驻不杀）
         if getattr(self, '_mapping', False):
-            subprocess.run(["pkill", "-f", "slam_toolbox|slam_gmapping|cartographer_node"])
+            subprocess.run(["pkill", "-f", "async_slam_toolbox_node|sync_slam_toolbox_node|mapper_online_async.launch.py|mapper_online_sync.launch.py"])
             subprocess.run(["pkill", "rviz2"])
             self._mapping = False
-            time.sleep(1)
-        subprocess.run(["pkill", "-f", "chassis_bridge"])
-        time.sleep(2)
 
-        # 启 Nav2
+        # 清独立看图残留（map_server/rviz2），避免与 Nav2 自带 map_server 双发布 /map
+        subprocess.run(["pkill", "-f", "map_server"])
+        subprocess.run(["pkill", "rviz2"])
+
+        # 停建图叠加层（叠加层互斥；底层组与桥常驻不杀）
+        if getattr(self, '_mapping', False):
+            subprocess.run(["pkill", "-f", "async_slam_toolbox_node|sync_slam_toolbox_node|mapper_online_async.launch.py|mapper_online_sync.launch.py"])
+            subprocess.run(["pkill", "rviz2"])
+            self._mapping = False
+            self._btn_start_slam.setText("开始建图")
+
+        # 清独立看图残留（map_server/rviz2），避免与 Nav2 自带 map_server 双发布 /map
+        subprocess.run(["pkill", "-f", "map_server"])
+        subprocess.run(["pkill", "rviz2"])
+
+        # 非阻塞准备：底层组 → 雷达，就绪后再拉 Nav2 叠加层
+        self._pending_map_file = map_file
+        self._prepare(
+            [("等待底盘桥 /odom",
+              lambda: self._topic_online("/odom"), 8, self._ensure_bridge),
+             ("等待底层组（EKF/静态 TF）",
+              lambda: self._topic_online("/odom_combined"), 12, self._ensure_bringup),
+             ("等待激光雷达 /scan",
+              lambda: self._topic_online("/scan"), 8, self._ensure_lidar)],
+            self._start_nav_overlay)
+
+    def _start_nav_overlay(self, ok):
+        """准备完成回调（GUI 线程）：起 nav2，延时再起 rviz2。"""
+        self._restore_start_buttons()
+        if not ok:
+            self.log_send("导航: 准备未完成，已取消（查日志：底层组或雷达未就绪）")
+            self.status_label.setText("状态:\n准备未完成")
+            return
+        import subprocess, os
+        map_file = getattr(self, "_pending_map_file", "")
+        nav2_params = ROS_WS + "/install/mower_nav2/share/mower_nav2/config/nav2_params.yaml"
         subprocess.Popen(
             ["bash", "-c",
-             self.ROS_SETUP + " && ros2 launch nav2_bringup bringup_launch.py map:=" + map_file],
+             self.ROS_SETUP + " && ros2 launch nav2_bringup bringup_launch.py"
+             " map:=" + map_file + " params_file:=" + nav2_params + " use_sim_time:=false"],
             env=dict(os.environ, DISPLAY=":0"))
-        time.sleep(3)
-
-        # 启 rviz2
-        rviz_cfg = RVIZ_CFG
-        subprocess.Popen(
-            ["bash", "-c",
-             self.ROS_SETUP + " && rviz2 -d " + rviz_cfg],
-            env=dict(os.environ, DISPLAY=":0"))
-
         self._nav_on = True
         self._btn_nav.setText("停止导航")
         self.status_label.setText("状态:\n导航中")
         self.log_send("导航: 已启动，在 rviz2 用 2D Goal Pose 点目标")
+        # 原来 time.sleep(3) 会卡主线程，改成单次定时器
+        QTimer.singleShot(3000, self._start_nav_rviz)
 
-    def _stop_slam(self):
-        import subprocess, time
-        # 先通过 ROS2 服务正常停止雷达电机
-        subprocess.run(
-            ["bash", "-c",
-             self.ROS_SETUP + " && timeout 3 ros2 service call /stop_motor std_srvs/srv/Empty '{}' 2>/dev/null"],
-            env=dict(os.environ, DISPLAY=":0"))
-        time.sleep(1)
-        subprocess.run(["pkill", "-f", "slam_toolbox|slam_gmapping|cartographer_node|rplidar|lslidar|x10"])
-        subprocess.run(["pkill", "rviz2"])
-        time.sleep(2)
-        # 把底盘桥拉回来
+    def _start_nav_rviz(self):
+        if not getattr(self, "_nav_on", False):
+            return
+        import subprocess, os
         subprocess.Popen(
-            ["bash", "-c",
-             self.BRIDGE_SETUP + " && " + self.BRIDGE_LAUNCH],
+            ["bash", "-c", self.ROS_SETUP + " && rviz2 -d " + RVIZ_CFG],
             env=dict(os.environ, DISPLAY=":0"))
-        self._mapping = False
-        self._btn_start_slam.setText("开始建图")
-        self.status_label.setText("就绪")
-        self.log_send("建图: 已停止, 控制已恢复")
-
-
 
     def show_map_gallery(self):
         self.setWindowTitle("地图库"); self._refresh_gallery(); self.stack_layout.setCurrentWidget(self.map_gallery_widget)
@@ -953,25 +1287,34 @@ class MainWindow(QWidget):
         dlg.exec_()
 
     def _open_map_rviz(self, name):
-        import subprocess, os, time
+        import subprocess, os
+        if TEST_MODE:
+            QMessageBox.information(self, "Mock 模式", "当前为 Mock 环境，独立地图查看请在真机模式使用。")
+            return
+        # 导航叠加层运行中不进入独立看图，避免双 map_server 发布 /map 冲突
+        if getattr(self, '_nav_on', False):
+            QMessageBox.warning(self, "提示", "导航进行中，请先停止导航再查看地图")
+            return
         yaml_file = os.path.join(MAP_DIR, name + ".yaml")
-        subprocess.run(["pkill", "-f", "map_server"]); time.sleep(1)
+        subprocess.run(["pkill", "-f", "map_server"])
         subprocess.Popen(
             ["bash", "-c",
              self.ROS_SETUP + " && ros2 run nav2_map_server map_server "
-             "--ros-args -p yaml_filename:=" + yaml_file],
+             "--ros-args -p use_sim_time:=false -p yaml_filename:=" + yaml_file],
             env=dict(os.environ, DISPLAY=":0"))
-        time.sleep(2)
-        # 激活 lifecycle 节点（否则不发布 /map）
+        # 等 map_server 起来再激活（原来 time.sleep(2) 会卡主线程）
+        QTimer.singleShot(2000, lambda: self._activate_map_server(name))
+
+    def _activate_map_server(self, name):
+        """map_server 起来后激活 lifecycle 并开 rviz2（GUI 线程，非阻塞链的一环）。"""
+        import subprocess, os
         subprocess.run(
             ["bash", "-c",
              self.ROS_SETUP + " && ros2 lifecycle set /map_server configure 2>/dev/null"
              " && ros2 lifecycle set /map_server activate 2>/dev/null"],
             env=dict(os.environ, DISPLAY=":0"))
-        rviz_cfg = RVIZ_CFG
         subprocess.Popen(
-            ["bash", "-c",
-             self.ROS_SETUP + " && rviz2 -d " + rviz_cfg],
+            ["bash", "-c", self.ROS_SETUP + " && rviz2 -d " + RVIZ_CFG],
             env=dict(os.environ, DISPLAY=":0"))
         self.log_send("rviz2查看(已加载map_server): " + name)
 
@@ -1068,78 +1411,37 @@ class MainWindow(QWidget):
             if hasattr(self, '_selftest_timer') and self._selftest_timer: self._selftest_timer.stop()
         if getattr(self, '_dock_running', False) or (self.dock.state != "IDLE"):
             self._dock_running = False; self.dock.stop(); stopped.append("回充")
-        # 手动速度一定停掉，但不计入 stopped —— 计入了下面就会补一帧**锁存**的急停，
-        # 开个自检还得先按解除急停，太容易把人绕进去。
-        if self._manual_vx or self._manual_vz:
-            self._keys_down.clear(); self._manual_set(0.0, 0.0)
         if stopped:
             self.serial_mgr.send(self.proto.build_emergency_frame())
             self._release_camera()
             self.log_send(f"接收到新任务, 已停止 {', '.join(stopped)}")
         return stopped
 
-    # ---------- 手动控制 ----------
-    # 补的是一条**完全没有**的通道：build_vel_frame 原先只有一个调用点，挂在
-    # DockController.on_vel_cmd 上，而 _tick() 从不调它 —— 手动速度是死代码。
-
-    def _manual_keys(self):
-        return (Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right,
-                Qt.Key_W, Qt.Key_S, Qt.Key_A, Qt.Key_D)
-
-    def _on_page_changed(self, _idx):
-        if self.stack_layout.currentWidget() is self.manual_widget:
-            self.setFocus()          # 焦点回到窗口，方向键才到得了 keyPressEvent
-        else:
-            self._keys_down.clear()
-            self._manual_set(0.0, 0.0)   # 切走就停，别留着一个速度在跑
-
-    def keyPressEvent(self, e):
-        # 只在手动控制页接管方向键 —— 免得在别的页面误触把车开走
-        if (self.stack_layout.currentWidget() is self.manual_widget
-                and not e.isAutoRepeat() and e.key() in self._manual_keys()):
-            self._keys_down.add(e.key()); self._apply_manual_keys(); e.accept(); return
-        super().keyPressEvent(e)
-
-    def keyReleaseEvent(self, e):
-        if (self.stack_layout.currentWidget() is self.manual_widget
-                and not e.isAutoRepeat() and e.key() in self._manual_keys()):
-            self._keys_down.discard(e.key()); self._apply_manual_keys(); e.accept(); return
-        super().keyReleaseEvent(e)
-
-    def _apply_manual_keys(self):
-        ks = self._keys_down
-
-        def want(pos, neg):
-            return bool(ks & pos) and not (ks & neg)
-
-        fwd = want({Qt.Key_Up, Qt.Key_W}, {Qt.Key_Down, Qt.Key_S})
-        back = want({Qt.Key_Down, Qt.Key_S}, {Qt.Key_Up, Qt.Key_W})
-        left = want({Qt.Key_Left, Qt.Key_A}, {Qt.Key_Right, Qt.Key_D})
-        right = want({Qt.Key_Right, Qt.Key_D}, {Qt.Key_Left, Qt.Key_A})
-        self._manual_set(self.MANUAL_V * (1 if fwd else -1 if back else 0),
-                         self.MANUAL_W * (1 if left else -1 if right else 0))
-
-    def _manual_set(self, vx, vz):
-        if (vx, vz) == (self._manual_vx, self._manual_vz):
-            return
-        self._manual_vx, self._manual_vz = vx, vz
-        if vx or vz:
-            self._manual_timer.start(100)
-            self.log_send("手动: Vx=%+.2f Vz=%+.2f" % (vx, vz))
-        else:
-            self._manual_timer.stop()
-            self.serial_mgr.send(self.proto.build_vel_frame(0.0, 0.0, 0.0))
-            self.log_send("手动: 停")
-
-    def _manual_tick(self):
-        # 10 Hz 重发。桥的看门狗是 0.5 s，这个频率够不上超时；面板万一崩了，
-        # 看门狗半秒后自己把车停下 —— 固件那道保护够不着（见 bridge/node.py）。
-        self.serial_mgr.send(self.proto.build_vel_frame(self._manual_vx, 0.0, self._manual_vz))
+    def update_leds(self, msg):
+        """根据状态消息更新指示灯"""
+        if '底盘桥' in msg:
+            self.led_chassis.setStyleSheet("color: #00cc44; font-size: 14px;")
+        elif '激光雷达' in msg:
+            self.led_lidar.setStyleSheet("color: #00cc44; font-size: 14px;")
+        elif 'EKF' in msg or 'odom_combined' in msg:
+            self.led_ekf.setStyleSheet("color: #00cc44; font-size: 14px;")
+        elif 'SLAM' in msg or '建图' in msg or '/map' in msg:
+            self.led_slam.setStyleSheet("color: #00cc44; font-size: 14px;")
+        elif '路径规划' in msg or 'Nav2' in msg:
+            self.led_nav.setStyleSheet("color: #00cc44; font-size: 14px;")
 
     def release_estop(self):
         self.serial_mgr.send(self.proto.build_release_frame())
         self.status_label.setText("状态:\n急停已解除")
         self.log_send("解除急停")
+        # 恢复所有按钮
+        self.btn_selftest.setEnabled(True)
+        self.btn_mow.setEnabled(True)
+        self.btn_follow.setEnabled(True)
+        self.btn_dock.setEnabled(True)
+        self.btn_stop.setEnabled(True)
+        self.btn_release.setEnabled(False)
+        self.btn_record.setEnabled(True)
 
     def start_self_test(self):
         self._cancel_tasks("自检"); self._release_camera()
@@ -1178,7 +1480,7 @@ class MainWindow(QWidget):
             self.log_send("割草区域: " + os.path.basename(maps[lst.currentRow() - 1]))
 
         self._cancel_tasks("割草"); self._release_camera()
-        # 这条路径不发刀片指令 —— 刀片控制已整套移除，原因见 docs/移除记录.md。
+        # 这条路径不发刀片指令 —— 刀片控制已整套移除。
         self.status_label.setText("状态:\n割草中(无刀片控制)")
         self.log_send("割草: 开始 —— 刀片未接入, 只有录像和导航")
         self._start_grab_record("割草")
@@ -1211,6 +1513,7 @@ class MainWindow(QWidget):
     def _on_dock_done(self): self._dock_running = False; self.status_label.setText("状态:\n对接完成")
 
     def stop_all(self):
+        self._abort_prepare()      # 取消可能还在跑的"等底层组/等雷达"流程
         stopped = []
         if getattr(self, '_selftest_running', False):
             self._selftest_running = False; stopped.append("自检")
@@ -1222,20 +1525,48 @@ class MainWindow(QWidget):
         if self._follow_on:
             self._follow_on = False
             self.btn_follow.setText("雷达跟随"); stopped.append("跟随")
-        if self._manual_vx or self._manual_vz:
-            self._keys_down.clear(); self._manual_set(0.0, 0.0); stopped.append("手动")
         if getattr(self, '_mapping', False):
-            self._lidar_running = False
-            self._mapping = False; stopped.append("建图")
-            # 原来这里写的是 self._mapping_window —— 全树没赋过值的属性，
-            # 建图中按急停会在这一行抛异常，**下面那帧急停就发不出去**。
-            if self._mapping_widget:
-                self._mapping_widget.close()
-                self._mapping_widget = None
+            self._pending_stop_after_save = False; self._map_saved = False; self._saving = False
+            self._btn_start_slam.setEnabled(True); self._btn_save_map.setEnabled(True)
+            if TEST_MODE:
+                self._stop_mock_mapping()
+            else:
+                self._btn_start_slam.setText("开始建图")
+                # 杀 slam 叠加层：launch 主进程 + 建图节点兜底（口径同 start_mapping 停止分支）
+                import subprocess, os
+                subprocess.run(
+                    ["bash", "-c",
+                     self.ROS_SETUP + " && timeout 3 ros2 service call /stop_motor std_srvs/srv/Empty '{}' >/dev/null 2>&1"],
+                    env=dict(os.environ, DISPLAY=":0"))
+                subprocess.run(["pkill", "-f", "async_slam_toolbox_node|sync_slam_toolbox_node|mapper_online_async.launch.py|mapper_online_sync.launch.py"])
+                subprocess.run(["pkill", "rviz2"])
+                self._mapping = False; stopped.append("建图")
+        if getattr(self, '_nav_on', False):
+            self._nav_on = False
+            self._btn_nav.setText("Nav2 导航"); stopped.append("导航")
+            # 杀 Nav2 叠加层：launch 主进程 + composition 容器 + 独立节点兜底（口径同 start_nav 停止分支）
+            import subprocess, os
+            subprocess.run(["pkill", "-f",
+                            "bringup_launch.py|nav2_container|component_container_isolated|"
+                            "controller_server|planner_server|bt_navigator|behavior_server|"
+                            "smoother_server|waypoint_follower|amcl|map_server|lifecycle_manager_navigation"])
+            subprocess.run(["pkill", "rviz2"])
+            subprocess.run(
+                ["bash", "-c",
+                 self.ROS_SETUP + " && timeout 3 ros2 service call /stop_motor std_srvs/srv/Empty '{}' >/dev/null 2>&1"],
+                env=dict(os.environ, DISPLAY=":0"))
         self.serial_mgr.send(self.proto.build_emergency_frame())
         self._speed_left = 0; self._speed_right = 0
         self.status_label.setText("状态:\n已停止")
         self.log_send("紧急停止: " + ", ".join(stopped) if stopped else "紧急停止"); self._release_camera()
+        # 锁定 UI：其他按钮禁用，只能点解除急停
+        self.btn_selftest.setEnabled(False)
+        self.btn_mow.setEnabled(False)
+        self.btn_follow.setEnabled(False)
+        self.btn_dock.setEnabled(False)
+        self.btn_stop.setEnabled(False)
+        self.btn_release.setEnabled(True)
+        self.btn_record.setEnabled(False)
 
     def _update_status(self):
         states = {'IDLE':'待机','SWEEPING':'扫描','VERIFYING':'验证','ROTATING':'旋转','UNDOCK':'退桩','DONE':'完成'}

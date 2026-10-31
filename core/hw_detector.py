@@ -2,10 +2,10 @@ import os
 import subprocess
 
 DEPTH_IDS = [("8086","0b07"),("8086","0b3a"),("2bc5","0403"),("2bc5","0502"),("2bc5","0511")]
-DEPTH_NAMES = {"8086:0b07":"Intel RealSense D435","8086:0b3a":"Intel RealSense D415",
-               "2bc5:0403":"Orbbec Astra","2bc5:0502":"Orbbec Astra Pro","2bc5:0511":"Orbbec 3D"}
+DEPTH_NAMES = {"8086:0b07":"深度相机","8086:0b3a":"深度相机",
+               "2bc5:0403":"深度相机","2bc5:0502":"深度相机","2bc5:0511":"深度相机"}
 LIDAR_IDS = [("10c4","ea60"),("1a86","7523")]
-LIDAR_NAMES = {"10c4:ea60":"RPLidar C1","1a86:7523":"RPLidar A1"}
+LIDAR_NAMES = {"10c4:ea60":"激光雷达","1a86:7523":"激光雷达"}
 
 def _has_usb_id(id_list):
     try:

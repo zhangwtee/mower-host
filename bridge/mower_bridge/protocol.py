@@ -1,6 +1,6 @@
 """割草机上下位机串口协议：11 字节发帧、24 字节收帧。
 
-字段位置全部对着固件源码核实过，出处见 docs/协议.md：
+字段位置全部对照固件源码核实：
     lawn-mower/BALANCE/uartx_callback.c      收帧分支（下位机侧）
     lawn-mower/BALANCE/data_task.c:98-137    回帧组包
 
@@ -11,8 +11,7 @@ import math
 FRAME_HEADER = 0x7B
 FRAME_TAIL = 0x7D
 
-# 发帧（上位机 → STM32）命令号。对照 uartx_callback.c 的分支，没有的别加
-# （删过哪些、为什么删，见 docs/移除记录.md）。
+# 发帧（上位机 → STM32）命令号。对照 uartx_callback.c 的分支，没有的别加。
 CMD_VEL = 0         # 三轴速度，mm/s，16 位有符号大端
 CMD_RECHARGE = 1    # 自动回充，同速度字段，走 charger.Up_Move*
 CMD_DOCK = 3        # 红外对接，同速度字段，走 charger.Dock_Move*

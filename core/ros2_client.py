@@ -4,10 +4,10 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.executors import MultiThreadedExecutor
 from nav_msgs.msg import Odometry, OccupancyGrid
-from geometry_msgs.msg import Twist
 from std_msgs.msg import Float32, Int16, Empty
+from slam_toolbox.srv import Pause as SlamPause
 from PyQt5.QtCore import QObject, pyqtSignal
-import threading, random, time
+import threading, random
 
 _INIT_LOCK = threading.Lock()
 _INITED = False
@@ -49,16 +49,32 @@ class Ros2Client(QObject):
         while self._running and rclpy.ok():
             executor.spin_once(timeout_sec=0.05)
 
+    def topic_online(self, topic):
+        """话题当前是否有发布者（O(1)，走 rclpy 图查询，不起子进程）。"""
+        n = getattr(self, "_node", None)
+        if n is None:
+            return False
+        try:
+            return n.count_publishers(topic) > 0
+        except Exception:
+            return False
+
+    def pause_slam(self):
+        """暂停建图：官方服务为 toggle 翻转、空请求，不支持指定目标态；当前无 UI 接线"""
+        if self._node and self._node.pause_client.wait_for_service(timeout_sec=0.5):
+            req = SlamPause.Request()
+            self._node.pause_client.call_async(req)
+
+    def resume_slam(self):
+        """恢复建图：同一 toggle 服务再次翻转；当前无 UI 接线"""
+        if self._node and self._node.pause_client.wait_for_service(timeout_sec=0.5):
+            req = SlamPause.Request()
+            self._node.pause_client.call_async(req)
+
     def send(self, data: bytes):
         if len(data) < 2 or self._node is None: return
         cmd = data[1]
-        if cmd == 0:
-            vx = _i16(data, 3, 4) / 1000.0
-            vy = _i16(data, 5, 6) / 1000.0
-            vz = _i16(data, 7, 8) / 1000.0
-            msg = Twist(); msg.linear.x = vx; msg.linear.y = vy; msg.angular.z = vz
-            self._node.cmd_vel_pub.publish(msg)
-        elif cmd == 4:
+        if cmd == 4:
             p = (data[3]<<8)|data[4]; msg = Int16(); msg.data = p
             self._node.servo_pub.publish(msg)
         elif cmd == 5: self._node.selftest_pub.publish(Empty())
@@ -71,7 +87,6 @@ class _BridgeNode(Node):
         super().__init__('robot_ui_bridge_' + str(random.randint(1000,9999)))
         self._parent = parent
         qos_s = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
-        self.cmd_vel_pub   = self.create_publisher(Twist, '/cmd_vel', 10)
         self.servo_pub     = self.create_publisher(Int16,  '/servo_cmd', 10)
         self.selftest_pub  = self.create_publisher(Empty,  '/selftest_cmd', 10)
         self.emergency_pub = self.create_publisher(Empty,  '/emergency_stop', 10)
@@ -80,6 +95,8 @@ class _BridgeNode(Node):
         self.create_subscription(Float32, '/PowerVoltage', self._volt_cb, 10)
         self.create_subscription(OccupancyGrid, '/map', self._map_cb, 10)
         self._vx = 0.0; self._vz = 0.0; self._bat = 22.8
+        # slam_toolbox 暂停/恢复：toggle 服务，空请求触发翻转；响应 status 为翻转后的新暂停态
+        self.pause_client = self.create_client(SlamPause, '/slam_toolbox/pause_new_measurements')
 
         # 延迟检查就绪状态（在单独线程里跑，每 3 秒一次，最多 5 轮）
         self._checked = set()
@@ -108,7 +125,7 @@ class _BridgeNode(Node):
 
             checks = [
                 ('/odom',          '底盘桥已就绪 → /odom /imu /PowerVoltage'),
-                ('/scan',          '激光雷达已就绪 → /scan (RPLidar C1)'),
+                ('/scan',          '激光雷达已就绪 → /scan'),
                 ('/odom_combined', 'EKF 融合已就绪 → /odom_combined'),
                 ('/map',           'SLAM 建图已就绪 → /map (slam_toolbox)'),
                 ('/cmd_vel',       '运动控制已就绪 → /cmd_vel'),
@@ -133,7 +150,3 @@ class _BridgeNode(Node):
                 self._status_timer.cancel()
         except:
             pass
-
-
-def _i16(d, h, l):
-    v = (d[h]<<8)|d[l]; return (v-0x10000) if v&0x8000 else v

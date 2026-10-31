@@ -1,6 +1,5 @@
 """简单雷达跟随 — 只在有目标时才发 /cmd_vel，不抢蓝牙"""
 import math
-import threading
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy

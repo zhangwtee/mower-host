@@ -9,8 +9,14 @@ class TagDetector:
 
     def __init__(self):
         self.dict = cv2.aruco.getPredefinedDictionary(TAG_FAMILY)
-        self.params = cv2.aruco.DetectorParameters()
-        self.detector = cv2.aruco.ArucoDetector(self.dict, self.params)
+        self._new_api = hasattr(cv2.aruco, "ArucoDetector")
+        if self._new_api:
+            self.params = cv2.aruco.DetectorParameters()
+            self.detector = cv2.aruco.ArucoDetector(self.dict, self.params)
+        else:
+            # OpenCV 4.6 及更早：旧版 API，无 ArucoDetector 对象类
+            self.params = cv2.aruco.DetectorParameters_create()
+            self.detector = None
 
         self.found = False
         self.corners = None
@@ -39,7 +45,10 @@ class TagDetector:
         return ok
 
     def _try_detect(self, gray, orig_w):
-        corners, ids, _ = self.detector.detectMarkers(gray)
+        if self._new_api:
+            corners, ids, _ = self.detector.detectMarkers(gray)
+        else:
+            corners, ids, _ = cv2.aruco.detectMarkers(gray, self.dict, parameters=self.params)
         if ids is not None:
             for i, tag_id in enumerate(ids):
                 if tag_id[0] == TAG_ID:

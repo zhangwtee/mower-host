@@ -4,8 +4,7 @@
 真正过串口的是桥 `bridge/mower_bridge/protocol.py`，**那份是权威实现**（含收帧解析），
 改协议时两边要一起改。
 
-字段对照固件 lawn-mower/BALANCE/uartx_callback.c 的分支，没有的别加（删过哪些、
-为什么删，见 docs/移除记录.md）。
+字段对照固件 lawn-mower/BALANCE/uartx_callback.c 的分支，没有的别加。
 """
 
 
@@ -13,7 +12,6 @@ class Protocol:
     FRAME_HEADER = 0x7B
     FRAME_TAIL   = 0x7D
 
-    CMD_VEL       = 0
     CMD_SERVO     = 4
     CMD_SELFTEST  = 5
     CMD_EMERGENCY = 7   # 锁存，只能靠复位或 CMD=8 解
@@ -45,10 +43,6 @@ class Protocol:
         v = max(-32768, min(32767, int(round(v))))
         return [(v >> 8) & 0xFF, v & 0xFF]
 
-    def build_vel_frame(self, vx, vy, vz):
-        return self._frame(self.CMD_VEL,
-                           self._s16(vx * 1000) + self._s16(vy * 1000) + self._s16(vz * 1000))
-
     def build_servo_frame(self, pulse_us):
         pulse_us = max(self.SERVO_MIN_US, min(self.SERVO_MAX_US, int(pulse_us)))
         return self._frame(self.CMD_SERVO, self._s16(pulse_us))
@@ -65,15 +59,11 @@ class Protocol:
 
 if __name__ == '__main__':
     p = Protocol()
-    assert p.build_vel_frame(0.5, 0, 0) == bytes(
-        [0x7B, 0x00, 0x00, 0x01, 0xF4, 0x00, 0x00, 0x00, 0x00, 0x8E, 0x7D])
-    # 负数：-0.5 m/s → 补码 0xFE0C
-    assert p.build_vel_frame(-0.5, 0, 0)[3:5] == bytes([0xFE, 0x0C])
     assert p.build_servo_frame(100)[3:5] == bytes([0x01, 0xF4])     # 夹到 500
     assert p.build_servo_frame(9999)[3:5] == bytes([0x09, 0xC4])    # 夹到 2500
     assert p.build_emergency_frame()[1] == 7
     assert p.build_release_frame()[1] == 8
-    for f in (p.build_vel_frame(1, 2, 3), p.build_servo_frame(1500),
+    for f in (p.build_servo_frame(1500),
               p.build_selftest_frame(), p.build_emergency_frame(),
               p.build_release_frame()):
         assert len(f) == 11 and f[0] == 0x7B and f[10] == 0x7D

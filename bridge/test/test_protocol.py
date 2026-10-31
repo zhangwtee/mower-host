@@ -1,6 +1,4 @@
 """协议层自检 —— 不依赖 ROS，直接 `python test/test_protocol.py` 就能跑。
-
-每个断言都对着固件源码，出处见 docs/协议.md。
 """
 import os
 import sys
@@ -8,7 +6,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 from mower_bridge.protocol import (  # noqa: E402
-    CMD_VEL, CMD_SERVO, CMD_EMERGENCY, CMD_RELEASE, DIST_LEN,
+    CMD_VEL, DIST_LEN,
     UplinkParser, Mahony, bcc, build_frame, build_vel_frame, build_servo_frame,
     build_selftest_frame, build_emergency_frame, build_release_frame, parse_uplink,
 )
