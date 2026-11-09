@@ -7,23 +7,28 @@
   * 帧同步用滚动缓冲 + 帧尾/BCC 双校验。固件吐的字节流里每个 0x7B 前面是
     0xFC，任何要求"前一字节是帧尾"的判据都会一帧都解不出来
     （见 protocol.UplinkParser 的说明）。
-  * **带 cmd_vel 超时看门狗**。固件有指令丢失检测（balance_task.c:58-64），
-    但门控在 SysVal.SecurityLevel==0，而 sys.c:41 把默认值设成 1（"指令丢失后
-    按最后一次速度指令运动"），全固件没有第二处赋值，上位机也改不了它
-    （frame[2] 没人读）。所以那道保护永不生效 —— 停发速度指令车会按最后速度
-    一直跑，只能靠这里兜。
+  * **带 cmd_vel 超时看门狗**。固件侧没有可用的指令丢失保护：一旦停发速度
+    指令，底盘会继续按最后一次速度跑。这个兜底只能放在桥里——所有速度指令
+    都要经过这里写串口。
   * 不写 TF。odom_combined → base_footprint 由 ekf_node 出（publish_tf: true）。
+  * **急停锁存 + 命令确认都在这里做**。固件的 emergency_stop 在 SelfTest_Run()
+    里立刻清零、不锁存，CMD=8 也没有对应分支；上行帧里也没有 ACK 位。
+    所以锁存由桥维护（锁存期间丢弃 /cmd_vel 并补零速），确认则靠上行帧里
+    编码器实测的速度去"看效果"，结果发到 /cmd_ack。
 """
+import json
 import math
+import queue
 import threading
 import time
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, ReliabilityPolicy
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Imu
-from std_msgs.msg import Float32, Int16, Empty
+from std_msgs.msg import Float32, Int16, Empty, String, Bool
 
 from .protocol import (
     Mahony, UplinkParser, parse_uplink,
@@ -31,7 +36,6 @@ from .protocol import (
     build_emergency_frame, build_release_frame,
 )
 
-# 【本机数据 · 不通用】下列方差为本车经验取值，非通用默认值。
 # 两套协方差：静止时更信编码器，运动时更信 IMU。
 # 位置 xy 的方差静止时给 1e-9、动起来给 1e-3；姿态在 2D 下不可信，一律 1e6。
 _COV_POSE_STILL = [1e-9, 0, 0, 0, 0, 0,
@@ -76,24 +80,44 @@ class ChassisBridge(Node):
         self.odom_frame_id = p('odom_frame_id', 'odom_combined').value
         self.robot_frame_id = p('robot_frame_id', 'base_footprint').value
         self.gyro_frame_id = p('gyro_frame_id', 'gyro_link').value
-        # 里程计修正系数。默认全 1.0 = **没标定过**，是留给实测的旋钮
-        # （真实车轮直径、地面摩擦和标称总有偏差）。走 1 m 差多少按比例改。
+        # 里程计修正系数。当前全 1.0；若走 1 m 有偏差，按比例改这几个值。
         self.odom_x_scale = p('odom_x_scale', 1.0).value
         self.odom_y_scale = p('odom_y_scale', 1.0).value
         self.odom_z_scale_positive = p('odom_z_scale_positive', 1.0).value
         self.odom_z_scale_negative = p('odom_z_scale_negative', 1.0).value
 
+        # 命令确认参数：上位机只能"观察效果"，不是帧级回执（固件没有序号/ACK 位）
+        # 桥启动即进入急停锁存：断电重启/桥崩溃重启后，车不会因为
+        # 一帧残留指令就动，必须由人显式「解除急停」。要放开设成 false。
+        self.estop_on_start = bool(p('estop_on_start', True).value)
+        # 软停保持时间：收到 /soft_stop 后这段时间内所有 /cmd_vel 强制按零速发，
+        # 防止另一路发布者（Nav2 / 跟随）把零速盖掉
+        self.soft_stop_hold = float(p('soft_stop_hold', 1.0).value)
+        self.ack_timeout_vel = p('ack_timeout_vel', 1.5).value
+        self.ack_timeout_estop = p('ack_timeout_estop', 0.6).value
+        self.ack_tol = p('ack_tol', 0.05).value
+        self.ack_ratio = p('ack_ratio', 0.25).value
+        self.ack_frames = int(p('ack_frames', 3).value)
+
         self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
         self.imu_pub = self.create_publisher(Imu, '/imu/data_raw', 10)
         self.volt_pub = self.create_publisher(Float32, '/PowerVoltage', 10)
+        self.ack_pub = self.create_publisher(String, '/cmd_ack', 10)
+        # 锁存状态用 latched 发布：界面上半路重启时也能立刻知道"现在是急停中"
+        self.estop_pub = self.create_publisher(
+            Bool, '/estop_state',
+            QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                       reliability=ReliabilityPolicy.RELIABLE))
 
         self.create_subscription(Empty, '/estop_release', self._on_release, 10)
         self.create_subscription(Empty, '/emergency_stop', self._on_emergency, 10)
         self.create_subscription(Empty, '/selftest_cmd', self._on_selftest, 10)
         self.create_subscription(Int16, '/servo_cmd', self._on_servo, 10)
         self.create_subscription(Twist, '/cmd_vel', self._on_cmd_vel, 10)
+        self.create_subscription(Empty, '/soft_stop', self._on_soft_stop, 10)
 
         self._parser = UplinkParser()
+        self._q = queue.Queue(maxsize=200)
         self._ahrs = Mahony()
         self._lock = threading.Lock()
         self._x = self._y = self._yaw = 0.0
@@ -101,6 +125,14 @@ class ChassisBridge(Node):
         self._last_cmd = None
         self._stopped = False
         self._volt_count = 0
+        self._estop = False          # 桥自己的急停锁存（固件那份不锁存）
+        self._pending = None         # 待确认命令
+        self._last_ack = 0.0
+        self._last_zero = 0.0
+        self._acked_cmd = None       # 已确认过的速度目标，避免持续流重复确认
+        self._last_meas = (0.0, 0.0) # 最近一帧实测速度
+        self._hold_until = 0.0       # 软停保持截止时刻
+        self._selftest_watch = None  # 自检运动观测窗口
 
         try:
             import serial
@@ -115,9 +147,13 @@ class ChassisBridge(Node):
 
         self._running = True
         threading.Thread(target=self._read_loop, daemon=True).start()
+        # 帧的解析与所有 publish 都在这个定时器里（executor 线程）做，
+        # 串口线程只负责读字节入队 —— 避免跨线程 publish
+        self.create_timer(0.01, self._drain)
         self.create_timer(0.1, self._watchdog)
         # rclpy 没有一次性定时器 —— 不销毁它每 10 秒会再报一次"静默期结束"。
         self._boot_timer = self.create_timer(BOOT_SILENCE_SEC, self._boot_done)
+        self._set_estop(self.estop_on_start)   # latched：后启动的界面也能拿到当前状态
 
         self.get_logger().info(
             'chassis_bridge 已起：%s@%d。固件上电后 %.0f 秒内不收命令，'
@@ -136,7 +172,10 @@ class ChassisBridge(Node):
             if not chunk:
                 continue
             for frame in self._parser.feed(chunk):
-                self._on_frame(frame)
+                try:
+                    self._q.put_nowait(frame)
+                except queue.Full:
+                    pass        # 队列满就丢帧，宁可少一帧也不拖住串口线程
 
     def _write(self, frame):
         with self._lock:
@@ -147,6 +186,14 @@ class ChassisBridge(Node):
 
     # ---- 收帧 → 话题 ----
 
+    def _drain(self):
+        while True:
+            try:
+                frame = self._q.get_nowait()
+            except queue.Empty:
+                return
+            self._on_frame(frame)
+
     def _on_frame(self, frame):
         d = parse_uplink(frame)
         now = self.get_clock().now()
@@ -154,9 +201,12 @@ class ChassisBridge(Node):
         dt = 0.0 if self._last_rx is None else (now - self._last_rx).nanoseconds * 1e-9
         self._last_rx = now
         dt = min(max(dt, 1e-4), 0.5)
+        self._last_meas = (d['vx'], d['vz'])
         self._publish_odom(d, dt, now)
         self._publish_imu(d, dt, now)
         self._publish_voltage(d)
+        self._check_ack(d)
+        self._check_selftest()
 
     def _publish_odom(self, d, dt, now):
         vx = d['vx'] * self.odom_x_scale
@@ -215,26 +265,149 @@ class ChassisBridge(Node):
 
     # ---- 话题 → 发帧 ----
 
+    def _on_soft_stop(self, msg):
+        """软停：保持一段时间强制零速，不锁存、不需要解除。"""
+        self._hold_until = time.monotonic() + self.soft_stop_hold
+        self._pending = None        # 之前的待确认作废，避免停完再报"未跟上"
+        self._acked_cmd = None
+        self._write(build_vel_frame(0.0, 0.0, 0.0))
+        self._ack('soft_stop', True, 0, 'hold_%.1fs' % self.soft_stop_hold)
+        self.get_logger().info('软停：%.1f 秒内强制零速' % self.soft_stop_hold)
+
     def _on_cmd_vel(self, msg):
+        if self._estop:
+            # 锁存期间任何速度指令都当零速处理，并持续补零帧压住固件侧的最后速度
+            self._write(build_vel_frame(0.0, 0.0, 0.0))
+            self._ack('vel', False, None, 'estop_latched')
+            return
+        if time.monotonic() < self._hold_until:
+            # 软停保持期：不管谁在发，一律零速；另一路发布者盖不掉
+            self._write(build_vel_frame(0.0, 0.0, 0.0))
+            self._ack('vel', False, None, 'soft_stop_hold')
+            return
         self._last_cmd = self.get_clock().now()
         self._stopped = False
         self._write(build_vel_frame(msg.linear.x, msg.linear.y, msg.angular.z))
+        vx, vz = msg.linear.x, msg.angular.z
+        if not vx and not vz:
+            # 停车指令不用确认，清掉待确认项
+            self._pending = None
+            self._acked_cmd = None
+            return
+        a = self._acked_cmd
+        if a is not None and abs(a[0] - vx) <= self.ack_tol and abs(a[1] - vz) <= self.ack_tol:
+            return          # 这个目标已经确认过，Nav2 20 Hz 持续流不再重复发确认
+        m0 = self._last_meas
+        if abs(m0[0] - vx) <= self.ack_tol and abs(m0[1] - vz) <= self.ack_tol:
+            # 车本来就在这个速度上（例如滑行），无从判断指令是否生效，如实报 no_change
+            self._ack('vel', True, 0, 'no_change')
+            self._pending = None
+            self._acked_cmd = (vx, vz)
+            return
+        p = self._pending
+        if (p is None or p.get('cmd') != 'vel'
+                or abs(p['vx'] - vx) > self.ack_tol or abs(p['vz'] - vz) > self.ack_tol):
+            # 目标变了才重新计时；同一目标的连续指令不打断计数
+            self._pending = {'cmd': 'vel', 'vx': vx, 'vz': vz,
+                             't0': time.monotonic(), 'hits': 0}
+            self._acked_cmd = None
 
     def _on_servo(self, msg):
         self._write(build_servo_frame(msg.data))
+        if time.monotonic() - self._last_ack > 2.0:
+            self._ack('servo', None, None, 'no_feedback')   # 上行帧没有舵机反馈
 
     def _on_selftest(self, msg):
         self._write(build_selftest_frame())
+        # 固件自检第一拍会设 Vx=0.3（SelfTest_Run），所以"动不动"可以观测
+        self._selftest_watch = {'t0': time.monotonic()}
+
+    def _check_selftest(self):
+        w = self._selftest_watch
+        if w is None:
+            return
+        elapsed = int((time.monotonic() - w['t0']) * 1000)
+        if abs(self._last_meas[0]) > 0.05:
+            self._ack('selftest', True, elapsed, 'motion_seen')
+            self._selftest_watch = None
+        elif elapsed > 3000:
+            self._ack('selftest', False, elapsed, 'no_motion')
+            self._selftest_watch = None
+
+    def _set_estop(self, active):
+        self._estop = active
+        m = Bool(); m.data = active
+        self.estop_pub.publish(m)
 
     def _on_emergency(self, msg):
+        self._set_estop(True)
+        self._stopped = True
         self._write(build_emergency_frame())
+        self._write(build_vel_frame(0.0, 0.0, 0.0))
+        self._pending = {'cmd': 'estop', 't0': time.monotonic(), 'hits': 0}
+        self.get_logger().warning('急停：桥已锁存，丢弃 /cmd_vel 直到 /estop_release')
 
     def _on_release(self, msg):
+        self._set_estop(False)
         self._write(build_release_frame())
+        self._pending = None
+        # 固件没有 CMD=8 分支，这里解除的是"桥的锁存"；帧发出去只是留痕
+        self._ack('release', True, 0, 'latch_cleared')
+
+    # ---- 命令确认（观察效果，不是帧级回执） ----
+
+    def _ack(self, cmd, ok, ms=None, why=''):
+        now = time.monotonic()
+        if why == 'estop_latched' and now - self._last_ack < 1.0:
+            return          # 锁存期间每个 /cmd_vel 都会触发，限流 1 秒一次
+        self._last_ack = now
+        m = String()
+        m.data = json.dumps({'cmd': cmd, 'ok': ok,
+                             'ms': ms if ms is not None else 0,
+                             'why': why}, ensure_ascii=False)
+        self.ack_pub.publish(m)
+
+    def _check_ack(self, d):
+        p = self._pending
+        if p is None:
+            return
+        t = time.monotonic()
+        elapsed = int((t - p['t0']) * 1000)
+        if p['cmd'] == 'vel':
+            tol_vx = max(self.ack_tol, self.ack_ratio * abs(p['vx']))
+            tol_vz = max(self.ack_tol, self.ack_ratio * abs(p['vz']))
+            if abs(d['vx'] - p['vx']) <= tol_vx and abs(d['vz'] - p['vz']) <= tol_vz:
+                p['hits'] += 1
+                if p['hits'] >= self.ack_frames:
+                    self._ack('vel', True, elapsed, 'speed_follows')
+                    self._acked_cmd = (p['vx'], p['vz'])
+                    self._pending = None
+            else:
+                p['hits'] = 0
+                if t - p['t0'] > self.ack_timeout_vel:
+                    self._ack('vel', False, elapsed, 'no_effect')
+                    self._pending = None
+        elif p['cmd'] == 'estop':
+            if abs(d['vx']) <= self.ack_tol and abs(d['vz']) <= self.ack_tol:
+                p['hits'] += 1
+                if p['hits'] >= self.ack_frames:
+                    self._ack('estop', True, elapsed, 'stopped')
+                    self._pending = None
+            else:
+                p['hits'] = 0
+                if t - p['t0'] > self.ack_timeout_estop:
+                    self._ack('estop', False, elapsed, 'still_moving')
+                    self._pending = None
 
     # ---- 看门狗 ----
 
     def _watchdog(self):
+        if self._estop or time.monotonic() < self._hold_until:
+            # 锁存/软停期间即使没有人发 /cmd_vel，也每 0.5 秒补一帧零速
+            if time.monotonic() - self._last_zero > 0.5:
+                self._write(build_vel_frame(0.0, 0.0, 0.0))
+                self._last_zero = time.monotonic()
+            return
         if self._last_cmd is None or self._stopped:
             return
         idle = (self.get_clock().now() - self._last_cmd).nanoseconds * 1e-9

@@ -1,10 +1,11 @@
 """ROS2 客户端 —— 启动时检测各组件就绪状态，逐个上报"""
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, QoSDurabilityPolicy
 from rclpy.executors import MultiThreadedExecutor
 from nav_msgs.msg import Odometry, OccupancyGrid
-from std_msgs.msg import Float32, Int16, Empty
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Float32, Int16, Empty, String, Bool
 from slam_toolbox.srv import Pause as SlamPause
 from PyQt5.QtCore import QObject, pyqtSignal
 import threading, random
@@ -23,6 +24,8 @@ class Ros2Client(QObject):
     sensor_updated = pyqtSignal(float, float, float, int)
     map_updated   = pyqtSignal(int, int, float, float, float, bytes)
     status_signal = pyqtSignal(str)
+    ack_signal    = pyqtSignal(str)
+    estop_signal  = pyqtSignal(bool)
     error_signal  = pyqtSignal(str)
 
     def __init__(self):
@@ -93,6 +96,16 @@ class Ros2Client(QObject):
             req = SlamPause.Request()
             self._node.pause_client.call_async(req)
 
+    def stop_motion(self):
+        """软停：让桥在一段时间内强制零速。
+
+        比直接发一条零速 /cmd_vel 可靠——桥是串口的唯一出口，保持期内
+        它会把所有来源的速度都压成零，Nav2 / 跟随盖不掉。
+        """
+        if self._node is None:
+            return
+        self._node.soft_stop_pub.publish(Empty())
+
     def send(self, data: bytes):
         if len(data) < 2 or self._node is None: return
         cmd = data[1]
@@ -109,6 +122,8 @@ class _BridgeNode(Node):
         super().__init__('robot_ui_bridge_' + str(random.randint(1000,9999)))
         self._parent = parent
         qos_s = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.cmd_vel_pub   = self.create_publisher(Twist,  '/cmd_vel', 10)
+        self.soft_stop_pub = self.create_publisher(Empty,  '/soft_stop', 10)
         self.servo_pub     = self.create_publisher(Int16,  '/servo_cmd', 10)
         self.selftest_pub  = self.create_publisher(Empty,  '/selftest_cmd', 10)
         self.emergency_pub = self.create_publisher(Empty,  '/emergency_stop', 10)
@@ -116,6 +131,10 @@ class _BridgeNode(Node):
         self.create_subscription(Odometry, '/odom', self._odom_cb, qos_s)
         self.create_subscription(Float32, '/PowerVoltage', self._volt_cb, 10)
         self.create_subscription(OccupancyGrid, '/map', self._map_cb, 10)
+        self.create_subscription(String, '/cmd_ack', self._ack_cb, 10)
+        qos_latch = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                               durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(Bool, '/estop_state', self._estop_cb, qos_latch)
         self._vx = 0.0; self._vz = 0.0; self._bat = 22.8
         # slam_toolbox 暂停/恢复：toggle 服务，空请求触发翻转；响应 status 为翻转后的新暂停态
         self.pause_client = self.create_client(SlamPause, '/slam_toolbox/pause_new_measurements')
@@ -129,6 +148,12 @@ class _BridgeNode(Node):
         self._vx = msg.twist.twist.linear.x
         self._vz = msg.twist.twist.angular.z
         self._parent.sensor_updated.emit(self._vx, self._vz, self._bat, 0)
+
+    def _ack_cb(self, msg):
+        self._parent.ack_signal.emit(msg.data)
+
+    def _estop_cb(self, msg):
+        self._parent.estop_signal.emit(bool(msg.data))
 
     def _volt_cb(self, msg):
         self._bat = msg.data

@@ -17,8 +17,8 @@ CMD_RECHARGE = 1    # 自动回充，同速度字段，走 charger.Up_Move*
 CMD_DOCK = 3        # 红外对接，同速度字段，走 charger.Dock_Move*
 CMD_SERVO = 4       # [3:4] = 脉宽 us，固件夹到 500~2500
 CMD_SELFTEST = 5    # 无字段
-CMD_EMERGENCY = 7   # 急停，锁存 —— 只能靠复位或 CMD=8 解
-CMD_RELEASE = 8     # 解除急停
+CMD_EMERGENCY = 7   # 急停：清三轴速度、打断自检（板载固件不锁存）
+CMD_RELEASE = 8     # 解除：板载固件没有这个分支，桥只用来清自己的锁存
 
 TX_LEN = 11
 RX_LEN = 24
@@ -31,7 +31,6 @@ SERVO_MAX_US = 2500
 #   lawn-mower/HARDWARE/ICM20948/ICM20948.c:107  REG_VAL_BIT_GYRO_FS_500DPS  → ±500 °/s
 #   lawn-mower/HARDWARE/ICM20948/ICM20948.c:110  REG_VAL_BIT_ACCEL_FS_2g     → ±2 g
 # 加速度那个除数固件里也有现成的，lawn-mower/BALANCE/balance_task.c:693。
-# 【本机数据 · 不通用】两个系数由本机固件量程写死，换底盘或刷不同固件必须重核。
 GYROSCOPE_RATIO = 0.00026644    # ±500 °/s
 ACCEL_RATIO = 1671.84           # ±2 g
 

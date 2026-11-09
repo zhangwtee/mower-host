@@ -7,6 +7,8 @@ import threading, random, time, math
 class MockRos2Client(QObject):
     sensor_updated = pyqtSignal(float, float, float, int)
     status_signal = pyqtSignal(str)
+    ack_signal    = pyqtSignal(str)
+    estop_signal  = pyqtSignal(bool)
     error_signal  = pyqtSignal(str)
 
     def __init__(self):
@@ -39,6 +41,10 @@ class MockRos2Client(QObject):
     def topic_online(self, topic):
         """Mock 模式：不判断真实话题，一律视为在线，避免准备流程卡住。"""
         return True
+
+    def stop_motion(self):
+        """Mock：无实际速度通道，空实现。"""
+        return
 
     def send(self, data: bytes):
         # Mock 模式：收到指令直接返回，不产生任何硬件动作

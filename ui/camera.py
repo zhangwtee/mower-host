@@ -228,7 +228,8 @@ class CameraMixin:
         if stopped_any:
             self._speed_left = 0; self._speed_right = 0
             self.status_label.setText("状态:\n就绪")
-            self.serial_mgr.send(self.proto.build_emergency_frame())
+            # 同上：只停动作，不触发急停锁存
+            self.serial_mgr.stop_motion()
 
     def open_camera_window(self):
         self.camera_window = QWidget(); self.camera_window.setWindowTitle("摄像头画面"); self.camera_window.resize(800, 600)

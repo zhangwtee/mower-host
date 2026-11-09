@@ -39,6 +39,8 @@ class MainWindow(WindowBase, PagesMixin, CameraMixin, SlamMixin, MockSlamMixin, 
         self.config = self._load_config()
         self.init_ui()
         self._rec_vx_buf = deque(maxlen=120); self._rec_vz_buf = deque(maxlen=120); self._rec_b_buf = deque(maxlen=120)
+        self.serial_mgr.ack_signal.connect(self._on_cmd_ack)
+        self.serial_mgr.estop_signal.connect(self._on_estop_state)
         self.serial_mgr.sensor_updated.connect(
             lambda l, r, batt, servo: (self._waveform.update_values(l, r, batt, servo),
                                        self._rec_vx_buf.append(l), self._rec_vz_buf.append(r),
@@ -127,10 +129,31 @@ class MainWindow(WindowBase, PagesMixin, CameraMixin, SlamMixin, MockSlamMixin, 
         if getattr(self, '_dock_running', False) or (self.dock.state != "IDLE"):
             self._dock_running = False; self.dock.stop(); stopped.append("回充")
         if stopped:
-            self.serial_mgr.send(self.proto.build_emergency_frame())
+            # 这里只是"停掉上一个任务、准备开新任务"，不能发急停帧：
+            # 桥把 CMD=7 当锁存信号，发下去会把新任务一起锁死。
+            self.serial_mgr.stop_motion()
             self._release_camera()
             self.log_send(f"接收到新任务, 已停止 {', '.join(stopped)}")
         return stopped
+
+    def _apply_estop_ui(self, active):
+        """急停锁存时：速度类按钮置灰，只留「解除急停」。"""
+        for b in ("btn_selftest", "btn_mow", "btn_follow", "btn_dock", "btn_stop", "btn_record"):
+            w = getattr(self, b, None)
+            if w is not None:
+                w.setEnabled(not active)
+        if getattr(self, "btn_release", None) is not None:
+            self.btn_release.setEnabled(active)
+
+    def _on_estop_state(self, active):
+        """桥的锁存状态（latched）：界面重启后也能回到正确状态。"""
+        self._apply_estop_ui(active)
+        if active:
+            self.status_label.setText("状态:\n急停中")
+            self.log_send("桥报告: 急停锁存中")
+        else:
+            if "急停" in self.status_label.text():
+                self.status_label.setText("状态:\n就绪")
 
     def _set_led(self, label, on, tip=""):
         """单个指示灯：在 = 绿，不在 = 灰。一个灯只有这两种状态。"""
@@ -158,18 +181,51 @@ class MainWindow(WindowBase, PagesMixin, CameraMixin, SlamMixin, MockSlamMixin, 
         self._set_led(self.led_slam, st.get("slam"), "/map")
         self._set_led(self.led_nav, st.get("nav"), "/plan")
 
+    def _on_cmd_ack(self, text):
+        """桥发来的命令确认：观察到的效果，不是帧级回执。"""
+        import json
+        try:
+            m = json.loads(text)
+        except Exception:
+            return
+        cmd, ok, ms, why = m.get("cmd"), m.get("ok"), m.get("ms", 0), m.get("why", "")
+        if cmd == "estop":
+            if ok:
+                self.status_label.setText("状态:\n已确认停止")
+                self.log_send(f"命令确认: 急停生效 {ms} ms")
+            else:
+                self.status_label.setText("状态:\n未确认停车!")
+                self.log_send(f"命令未确认: 急停后仍在动（{why}）")
+        elif cmd == "release":
+            self.status_label.setText("状态:\n急停已解除")
+            self._apply_estop_ui(False)
+            self.log_send("命令确认: 桥锁存已解除")
+        elif cmd == "vel":
+            if not ok:
+                if why == "estop_latched":
+                    self.log_send("速度指令被丢弃：急停锁存中")
+                elif why == "soft_stop_hold":
+                    pass        # 软停保持期，属于预期行为，不刷日志
+                else:
+                    self.log_send(f"命令未确认: 速度未跟上（{why}）")
+        elif cmd == "selftest":
+            if ok:
+                self.log_send(f"命令确认: 自检已启动（{ms} ms 观测到运动）")
+            else:
+                self.log_send("命令未确认: 自检 3 秒内没有动起来")
+        elif cmd == "soft_stop":
+            self.log_send(f"桥已执行软停（保持 {why.split('_')[-1]}）")
+        elif cmd == "servo":
+            # 回充扫掠时 30 Hz，日志限流 10 秒一次
+            import time as _t
+            if _t.monotonic() - getattr(self, "_last_servo_ack", 0.0) > 10.0:
+                self._last_servo_ack = _t.monotonic()
+                self.log_send("舵机指令已发送（上行帧无回读）")
+
     def release_estop(self):
         self.serial_mgr.send(self.proto.build_release_frame())
-        self.status_label.setText("状态:\n急停已解除")
-        self.log_send("解除急停")
-        # 恢复所有按钮
-        self.btn_selftest.setEnabled(True)
-        self.btn_mow.setEnabled(True)
-        self.btn_follow.setEnabled(True)
-        self.btn_dock.setEnabled(True)
-        self.btn_stop.setEnabled(True)
-        self.btn_release.setEnabled(False)
-        self.btn_record.setEnabled(True)
+        self.status_label.setText("状态:\n解除中...")
+        self.log_send("解除急停（等桥确认）")
 
     def start_self_test(self):
         self._cancel_tasks("自检"); self._release_camera()
@@ -286,16 +342,10 @@ class MainWindow(WindowBase, PagesMixin, CameraMixin, SlamMixin, MockSlamMixin, 
                 env=dict(os.environ, DISPLAY=":0"))
         self.serial_mgr.send(self.proto.build_emergency_frame())
         self._speed_left = 0; self._speed_right = 0
-        self.status_label.setText("状态:\n已停止")
+        self.status_label.setText("状态:\n已停止（待确认）")
         self.log_send("紧急停止: " + ", ".join(stopped) if stopped else "紧急停止"); self._release_camera()
         # 锁定 UI：其他按钮禁用，只能点解除急停
-        self.btn_selftest.setEnabled(False)
-        self.btn_mow.setEnabled(False)
-        self.btn_follow.setEnabled(False)
-        self.btn_dock.setEnabled(False)
-        self.btn_stop.setEnabled(False)
-        self.btn_release.setEnabled(True)
-        self.btn_record.setEnabled(False)
+        self._apply_estop_ui(True)
 
     def _update_status(self):
         states = {'IDLE':'待机','SWEEPING':'扫描','VERIFYING':'验证','ROTATING':'旋转','UNDOCK':'退桩','DONE':'完成'}

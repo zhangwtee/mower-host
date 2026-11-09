@@ -14,8 +14,8 @@ class Protocol:
 
     CMD_SERVO     = 4
     CMD_SELFTEST  = 5
-    CMD_EMERGENCY = 7   # 锁存，只能靠复位或 CMD=8 解
-    CMD_RELEASE   = 8   # 解除急停
+    CMD_EMERGENCY = 7   # 急停：固件清三轴速度、打断自检；锁存由桥维护
+    CMD_RELEASE   = 8   # 解除：上位机用它清桥的锁存，帧发出仅留痕
 
     SERVO_MIN_US = 500
     SERVO_MAX_US = 2500
