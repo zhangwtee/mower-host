@@ -1,6 +1,6 @@
 # 割草机上位机（mower-host）
 
-树莓派上跑的控制面板，一块 PyQt5 界面加一个 ROS2 底盘串口桥。
+树莓派上跑的控制面板。
 
 上机前先读 [DISCLAIMER.md](DISCLAIMER.md)。
 
@@ -13,7 +13,7 @@
 
 ## 硬件与依赖
 
-底盘是 STM32F407 加一块驱动板，雷达用 RPLidar C1，USB 转串口那颗芯片是 CH340，设备 ID `1a86:55d4`。
+底盘是 STM32F407 加一块驱动板，雷达用 RPLidar C1，USB 转串口芯片是 CH340，设备 ID `1a86:55d4`。
 
 软件要装 ROS 2 Jazzy，另外装 `robot_localization`，`/odom_combined` 和 TF 由它出。要建图导航再装 `slam_toolbox` 或 Nav2。
 
@@ -55,7 +55,9 @@ source bridge/install/setup.bash
 python3 main.py
 ```
 
-界面启动时自己拉起底盘桥（`_start_bridge()`，定义见 `ui/slam.py`），日志里能看到三层 source 的前缀。所以**不要再单独起桥**——串口同一时刻只能一个进程开，手动再起的那份会因为抢不到 `/dev/mower_chassis` 退出。
+界面启动时自己拉起底盘桥（`_start_bridge()`，定义见 `ui/slam.py`），日志里能看到三层 source 的前缀。
+
+桥启动即进入**急停锁存**（参数 `estop_on_start`，默认 true）：界面会显示「急停中」，除「解除急停」外按钮都置灰。这是刻意设计的——断电/重启后不会因为一帧残留指令就动，必须先由人按一下解除。不想要这个行为就把参数改成 false。所以**不要再单独起桥**——串口同一时刻只能一个进程开，手动再起的那份会因为抢不到 `/dev/mower_chassis` 退出。
 
 单独调试桥的时候反过来：先 `ros2 launch mower_bridge chassis_bridge.launch.py`，再开界面时它仍会尝试起第二份并失败，看日志忽略即可；`core/config.py` 里 `TEST_MODE = True` 可以让界面完全不碰硬件。
 
@@ -86,7 +88,7 @@ ros2 topic echo /odom                          # 往 /dev/pts/4 灌帧，看有�
 
 ## 文档
 
-- [docs/功能.md](docs/功能.md)：每颗按钮管什么、桥收发哪些话题、文件落在哪，末尾一节写着还没做的部分断在哪一行。
+- [docs/功能.md](docs/功能.md)：每颗按钮管什么、桥收发哪些话题、文件落在哪，末尾一节列着还没做完的部分。
 - [docs/协议.md](docs/协议.md)：11/24 字节帧完整规格、每个 CMD、上电静默期。改桥之前先看这份。
 - [docs/架构.md](docs/架构.md)：上下位机怎么分、看门狗为什么必须由桥来兜。
 - [docs/移除记录.md](docs/移除记录.md)：删掉的东西和删的理由。

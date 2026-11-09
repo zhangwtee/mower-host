@@ -23,9 +23,7 @@ def generate_launch_description():
                 'robot_frame_id': 'base_footprint',
                 'gyro_frame_id': 'gyro_link',
 
-                # 【本机数据 · 不通用】四轴系数按本车标定，换车/换轮径需重新标定。
-                # 里程计标定旋钮。默认全 1.0 = 没标定过，是留给实测的。
-                # 走 1 m 差多少，按比例改这里（前进/后退各一个）。
+                # 里程计修正系数：换车/换轮径需重新标定；走 1 m 差多少，按比例改这里（前进/后退各一个）。
                 'odom_x_scale': 1.0,
                 'odom_y_scale': 1.0,
                 'odom_z_scale_positive': 1.0,
