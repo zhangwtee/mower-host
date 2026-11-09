@@ -4,8 +4,8 @@
   <name>mower_bridge</name>
   <version>0.1.0</version>
   <description>割草机底盘串口桥：收发全包，mower-host 独占这个串口</description>
-  <maintainer email="todo@example.com">mower</maintainer>
-  <license>Proprietary</license>
+  <maintainer email="271764742+zhangwtee@users.noreply.github.com">zhangwtee</maintainer>
+  <license>MIT</license>
 
   <depend>rclpy</depend>
   <depend>nav_msgs</depend>

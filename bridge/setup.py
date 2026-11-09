@@ -16,10 +16,10 @@ setup(
     ],
     install_requires=['setuptools', 'pyserial'],
     zip_safe=True,
-    maintainer='mower',
-    maintainer_email='todo@example.com',
+    maintainer='zhangwtee',
+    maintainer_email='271764742+zhangwtee@users.noreply.github.com',
     description='割草机底盘串口桥：收发全包，mower-host 独占这个串口',
-    license='Proprietary',
+    license='MIT',
     entry_points={
         'console_scripts': [
             'chassis_bridge = mower_bridge.node:main',
