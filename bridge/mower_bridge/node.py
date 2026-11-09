@@ -31,6 +31,7 @@ from .protocol import (
     build_emergency_frame, build_release_frame,
 )
 
+# 【本机数据 · 不通用】下列方差为本车经验取值，非通用默认值。
 # 两套协方差：静止时更信编码器，运动时更信 IMU。
 # 位置 xy 的方差静止时给 1e-9、动起来给 1e-3；姿态在 2D 下不可信，一律 1e6。
 _COV_POSE_STILL = [1e-9, 0, 0, 0, 0, 0,

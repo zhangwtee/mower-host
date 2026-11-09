@@ -49,6 +49,28 @@ class Ros2Client(QObject):
         while self._running and rclpy.ok():
             executor.spin_once(timeout_sec=0.05)
 
+    # 五个指示灯各自对应的话题（有发布者即视为该层在跑）
+    LED_TOPICS = {
+        "chassis": "/odom",
+        "lidar": "/scan",
+        "ekf": "/odom_combined",
+        "slam": "/map",
+        "nav": "/plan",
+    }
+
+    def ready_state(self):
+        """指示灯用的实时状态：话题当前是否有发布者。O(1)，不起子进程。"""
+        n = getattr(self, "_node", None)
+        if n is None:
+            return {}
+        out = {}
+        for key, topic in self.LED_TOPICS.items():
+            try:
+                out[key] = n.count_publishers(topic) > 0
+            except Exception:
+                out[key] = False
+        return out
+
     def topic_online(self, topic):
         """话题当前是否有发布者（O(1)，走 rclpy 图查询，不起子进程）。"""
         n = getattr(self, "_node", None)

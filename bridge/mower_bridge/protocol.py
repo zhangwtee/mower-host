@@ -31,6 +31,7 @@ SERVO_MAX_US = 2500
 #   lawn-mower/HARDWARE/ICM20948/ICM20948.c:107  REG_VAL_BIT_GYRO_FS_500DPS  → ±500 °/s
 #   lawn-mower/HARDWARE/ICM20948/ICM20948.c:110  REG_VAL_BIT_ACCEL_FS_2g     → ±2 g
 # 加速度那个除数固件里也有现成的，lawn-mower/BALANCE/balance_task.c:693。
+# 【本机数据 · 不通用】两个系数由本机固件量程写死，换底盘或刷不同固件必须重核。
 GYROSCOPE_RATIO = 0.00026644    # ±500 °/s
 ACCEL_RATIO = 1671.84           # ±2 g
 

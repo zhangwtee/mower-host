@@ -31,6 +31,11 @@ class MockRos2Client(QObject):
     def stop(self):
         self._running = False
 
+    def ready_state(self):
+        """Mock：底盘/雷达/EKF 视为在线，建图与导航按需再亮。"""
+        return {"chassis": True, "lidar": True, "ekf": True,
+                "slam": False, "nav": False}
+
     def topic_online(self, topic):
         """Mock 模式：不判断真实话题，一律视为在线，避免准备流程卡住。"""
         return True

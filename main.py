@@ -118,7 +118,6 @@ def main():
             setattr(window, '_speed_left', l),
             setattr(window, '_speed_right', r)))
     serial_mgr.status_signal.connect(window.log_send)
-    serial_mgr.status_signal.connect(window.update_leds)
     serial_mgr.start()
     
     sys.exit(app.exec_())
