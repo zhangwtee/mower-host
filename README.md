@@ -6,7 +6,7 @@
 
 ## 功能
 
-- PyQt5 控制面板，界面和按钮都写在 `ui/main_window.py`
+- PyQt5 控制面板，代码在 `ui/`：`main_window.py` 只做装配，页面、相机、建图、地图库分在各自模块
 - ROS2 底盘串口桥，`bridge/` 里的 `chassis_bridge` 节点把 `/cmd_vel` 与 `/dev/mower_chassis` 互相转换，装上就能控底盘
 - 回充舵机扫描
 - 11 字节帧协议，备用路径，可以脱机自检
@@ -26,7 +26,11 @@
 │  core/ros2_client.py   话题                          │
 │  core/protocol.py      11 字节帧（备用/离线自检）    │
 │  core/dock_controller.py  回充舵机扫描               │
-│  ui/main_window.py     所有界面和按钮                │
+│  ui/                  控制面板（8 个模块）           │
+│    main_window.py 装配/任务/清理/指示灯              │
+│    pages.py 页面与切页   camera.py 摄像头与录像      │
+│    slam.py 建图导航     maplib.py 地图库             │
+│    mock_slam.py Mock     base.py/const.py 公共       │
 ├──────────────────────────────────────────────────────┤
 │  bridge/  ← ROS2 包 mower_bridge                     │
 │    chassis_bridge 节点：/cmd_vel ↔ /dev/mower_chassis│
@@ -48,13 +52,16 @@ cd bridge && colcon build                       # 桥要单独编一次
 ```bash
 source /opt/ros/jazzy/setup.bash
 source bridge/install/setup.bash
-ros2 launch mower_bridge chassis_bridge.launch.py     # 终端 1
-python3 main.py                                        # 终端 2
+python3 main.py
 ```
 
-树莓派上的绝对路径有三处，写在 [ui/main_window.py](ui/main_window.py) 开头：`ROS_WS` 是 SLAM/Nav2 的工作空间，`MAP_DIR` 是地图存放目录，`RVIZ_CFG` 指向 rviz 配置。换机器改这三个常量。
+界面启动时自己拉起底盘桥（`_start_bridge()`，定义见 `ui/slam.py`），日志里能看到三层 source 的前缀。所以**不要再单独起桥**——串口同一时刻只能一个进程开，手动再起的那份会因为抢不到 `/dev/mower_chassis` 退出。
 
-界面上「启动系统」按钮会自动带上上面两条 source，定义在 `main_window.py` 的 `BRIDGE_SETUP` 和 `BRIDGE_LAUNCH`，路径按文件位置推，换目录不用改。
+单独调试桥的时候反过来：先 `ros2 launch mower_bridge chassis_bridge.launch.py`，再开界面时它仍会尝试起第二份并失败，看日志忽略即可；`core/config.py` 里 `TEST_MODE = True` 可以让界面完全不碰硬件。
+
+树莓派上的绝对路径集中在 [ui/const.py](ui/const.py)：`ROS_WS` 是 SLAM/Nav2 的工作空间，`MAP_DIR` 是地图目录，`RVIZ_CFG` 指向 rviz 配置。换机器只改这一个文件。
+
+启动命令的拼装（三层 overlay：Jazzy → mower_ws → 底盘桥）定义在 `ui/base.py` 的 `WindowBase` 上（`ROS_SETUP` / `BRIDGE_SETUP` / `BRIDGE_LAUNCH` / `BRINGUP_LAUNCH`），路径按文件位置推，换目录不用改。
 
 ## 脱机自检
 

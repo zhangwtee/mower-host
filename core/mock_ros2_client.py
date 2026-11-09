@@ -41,7 +41,7 @@ class MockRos2Client(QObject):
         return True
 
     def send(self, data: bytes):
-        # Mock 模式下收到指令就"假装"执行了
+        # Mock 模式：收到指令直接返回，不产生任何硬件动作
         pass
 
     # ---------- 传感器假数据 ----------
