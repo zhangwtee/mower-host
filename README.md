@@ -70,7 +70,9 @@ python3 main.py
 没接底盘、甚至在 Windows 上也能开界面。`ros2_client.py` 在 ROS 没起来的时候静默丢弃发送、不发状态，界面本身不崩。协议层可以脱机跑：
 
 ```bash
-python3 core/protocol.py        # 组帧字节序列自检
+python3 core/protocol.py                 # 组帧字节序列自检
+python3 bridge/test/test_protocol.py     # 帧解析与重同步
+python3 bridge/test/test_distance.py     # 超声波帧解析
 python3 bridge/test/test_protocol.py   # 11 项：组帧 / 解析 / 重同步 / Mahony
 ```
 
@@ -89,7 +91,7 @@ ros2 topic echo /odom                          # 往 /dev/pts/4 灌帧，看有�
 ## 文档
 
 - [docs/功能.md](docs/功能.md)：每颗按钮管什么、桥收发哪些话题、文件落在哪，末尾一节列着还没做完的部分。
-- [docs/协议.md](docs/协议.md)：11/24 字节帧完整规格、每个 CMD、上电静默期。改桥之前先看这份。
+- [docs/协议.md](docs/协议.md)：11/24 字节帧完整规格、每个 CMD、上电静默 10 秒 + 自检 4.2 秒。改桥之前先看这份。
 - [docs/架构.md](docs/架构.md)：上下位机怎么分、看门狗为什么必须由桥来兜。
 - [docs/移除记录.md](docs/移除记录.md)：删掉的东西和删的理由。
 
@@ -104,4 +106,4 @@ ros2 topic echo /odom                          # 往 /dev/pts/4 灌帧，看有�
 
 [LICENSE](LICENSE)：MIT。
 
-上位机和下位机是两个仓库，这份只有上位机。下位机的 STM32 固件还没整理完，暂不发布。
+上位机和下位机是两个仓库，这份只有上位机。下位机固件（`mower-chassis`）已经重写完成，但还没在实机上跑过，等验证完再发布。

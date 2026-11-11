@@ -12,7 +12,7 @@ def generate_launch_description():
             parameters=[{
                 'port': '/dev/mower_chassis',
                 'baud': 115200,
-                # 停发 /cmd_vel 多久算丢指令。固件那道保护够不着（见 node.py 顶部
+                # 停发 /cmd_vel 多久算丢指令。固件那道 500ms 在，这道管的是 nav 侧（见 node.py 顶部
                 # 说明），停车只能靠这个。
                 'cmd_vel_timeout': 0.5,
 

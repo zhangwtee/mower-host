@@ -11,13 +11,13 @@ from mower_bridge.protocol import (  # noqa: E402
     build_selftest_frame, build_emergency_frame, build_release_frame, parse_uplink,
 )
 
-# 固件 data_task.h:23-24
+# 固件 app/telemetry.h
 DIST_HEADER = 0xFA
 DIST_TAIL = 0xFC
 
 
 def uplink(vx=0, vy=0, vz=0, acc=(0, 0, 0), gyro=(0, 0, 0), volt=24000, flag=0):
-    """照 data_task.c:98-137 组一个 24 字节底盘帧（原始单位）。"""
+    """照 mower-chassis/app/telemetry.c 组一个 24 字节底盘帧（原始单位）。"""
     b = bytearray(24)
     b[0] = 0x7B
     b[1] = flag
@@ -38,7 +38,7 @@ def uplink(vx=0, vy=0, vz=0, acc=(0, 0, 0), gyro=(0, 0, 0), volt=24000, flag=0):
 
 
 def distance_block(with_stray_header=False):
-    """照 data_task.c:169-189：19 字节超声波帧，固件无条件跟在底盘帧后。
+    """照 mower-chassis/app/telemetry.c：19 字节超声波帧，固件无条件跟在底盘帧后。
     割草机没这硬件，内容是全零 + BCC。"""
     b = bytearray(DIST_LEN)
     b[0] = DIST_HEADER
@@ -79,7 +79,7 @@ def test_bcc_and_shape():
         assert f[0] == 0x7B and f[10] == 0x7D and f[2] == 0
         assert f[9] == bcc(f, 9)
     assert build_emergency_frame()[1] == 7
-    assert build_release_frame()[1] == 8       # 固件 uartx_callback.c:151
+    assert build_release_frame()[1] == 8       # 固件 app/protocol.c 的 CMD=8
 
 
 def test_parse_uplink_roundtrip():

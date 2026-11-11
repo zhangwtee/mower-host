@@ -100,7 +100,7 @@ def main():
     protocol = Protocol()
     dock_ctrl = DockController(protocol)
     window = MainWindow(serial_mgr, protocol, dock_ctrl)
-    # 自适应屏幕：按可用桌面取尺寸并居中，保持**普通窗口**（可拖边缘调整大小）。
+    # 窗口按可用桌面取大小并居中，普通窗口，边缘能拖
     # 不用 showMaximized()——最大化状态下 GNOME 不能直接拖边改尺寸，用户会觉得"不能调大小"。
     # 尺寸按屏幕留边推算：可用区各边留 12/8 px，上限 1200×900（大屏也不至于拉太开）。
     _scr = app.primaryScreen().availableGeometry()

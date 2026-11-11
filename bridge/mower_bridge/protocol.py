@@ -1,42 +1,40 @@
-"""割草机上下位机串口协议：11 字节发帧、24 字节收帧。
+"""串口协议。发 11 字节,收 24 字节。
 
-字段位置全部对照固件源码核实：
-    lawn-mower/BALANCE/uartx_callback.c      收帧分支（下位机侧）
-    lawn-mower/BALANCE/data_task.c:98-137    回帧组包
+字段位置是照着 mower-chassis 的源码一个个核的:
+app/protocol.c 管收,app/telemetry.c 管回。
 
-上位机 core/protocol.py 只管组发帧、不解析，是这里的发帧子集。
+core/protocol.py 只管组发帧、不解析,算是这里的子集。
 """
 import math
 
 FRAME_HEADER = 0x7B
 FRAME_TAIL = 0x7D
 
-# 发帧（上位机 → STM32）命令号。对照 uartx_callback.c 的分支，没有的别加。
+# 发帧（上位机 → STM32）命令号。对照 mower-chassis/app/protocol.c 的分支，没有的别加。
 CMD_VEL = 0         # 三轴速度，mm/s，16 位有符号大端
 CMD_RECHARGE = 1    # 自动回充，同速度字段，走 charger.Up_Move*
 CMD_DOCK = 3        # 红外对接，同速度字段，走 charger.Dock_Move*
 CMD_SERVO = 4       # [3:4] = 脉宽 us，固件夹到 500~2500
 CMD_SELFTEST = 5    # 无字段
-CMD_EMERGENCY = 7   # 急停：清三轴速度、打断自检（板载固件不锁存）
-CMD_RELEASE = 8     # 解除：板载固件没有这个分支，桥只用来清自己的锁存
+CMD_EMERGENCY = 7   # 急停：固件锁存进 ESTOP，必须收到 CMD=8 才退出
+CMD_RELEASE = 8     # 解除急停：固件靠它退出 ESTOP，还要求使能开关在位
 
 TX_LEN = 11
 RX_LEN = 24
-DIST_LEN = 19       # 超声波帧，固件无条件跟在底盘帧后；割草机没这硬件，不解析
+DIST_LEN = 19       # 超声波帧，固件每拍跟在底盘帧后；解析在 DistanceParser
 
 SERVO_MIN_US = 500
 SERVO_MAX_US = 2500
 
-# IMU 原始值 → 物理单位。量程由固件配死：
-#   lawn-mower/HARDWARE/ICM20948/ICM20948.c:107  REG_VAL_BIT_GYRO_FS_500DPS  → ±500 °/s
-#   lawn-mower/HARDWARE/ICM20948/ICM20948.c:110  REG_VAL_BIT_ACCEL_FS_2g     → ±2 g
-# 加速度那个除数固件里也有现成的，lawn-mower/BALANCE/balance_task.c:693。
+# IMU 原始值 → 物理单位。量程在固件里写死了(±500°/s、±2g),
+# 哪天 bsp/imu.c 改了这两个数,这里也得跟着改。
+# 姿态已经由固件转到上位机坐标,这边只做单位换算。
 GYROSCOPE_RATIO = 0.00026644    # ±500 °/s
 ACCEL_RATIO = 1671.84           # ±2 g
 
 
 def bcc(data, n):
-    """前 n 字节逐字节异或。同固件 data_task.c:45 的 Check_BCC。"""
+    """前 n 字节逐字节异或。同固件 app/protocol.c 的 protocol_bcc。"""
     v = 0
     for i in range(n):
         v ^= data[i]
@@ -96,13 +94,12 @@ def build_release_frame():
 class UplinkParser:
     """24 字节底盘帧的滚动缓冲解析器。
 
-    **不能**用「上一字节是帧尾，当前字节才是帧头」那种判据。固件 data_task.c:242
-    在每帧底盘数据后面**无条件**再发 19 字节超声波帧（data_task.h:23-24，头 0xFA
-    尾 0xFC），所以每个 0x7B 的前一字节是 0xFC —— 按那条判据 count 永远起不来，
-    一帧都解不出来。
+    别用"上一字节是帧尾"那种判据。固件每帧底盘数据后面都紧跟一帧 19 字节超声波
+    (app/telemetry.h，头 0xFA 尾 0xFC)，所以每个 0x7B 前面都是 0xFC，按那条判据
+    count 根本起不来,一帧都解不出来。当初照着老代码抄就是这个坑。
 
-    改成扫 0x7B 取 24 字节、用帧尾 + BCC 双重校验，不通过就丢 1 字节重扫。
-    假阳性约 1/65536，且不会失步。
+    做法是扫 0x7B 取 24 字节，帧尾和 BCC 都对上才认，不对就丢 1 字节重扫。
+    假阳性大概 1/65536，失步了也能自己回来。
     """
 
     def __init__(self):
@@ -131,10 +128,10 @@ class UplinkParser:
 
 
 def parse_uplink(frame):
-    """24 字节底盘帧 → dict。布局见 data_task.c:98-137。
+    """24 字节底盘帧 → dict。布局见 mower-chassis/app/telemetry.c。
 
     [1] 是 robot_control.FlagStop —— 源码里那句 //set aside //预留位 是错的，
-    data_task.c:99 明确给它赋了值。
+    app/telemetry.c 明确给它赋了值（固件里就是 flag_stop）。
     """
     return {
         'flag_stop': frame[1],
@@ -145,6 +142,56 @@ def parse_uplink(frame):
         'gyro': tuple(_i16(frame, 14 + 2 * i) * GYROSCOPE_RATIO for i in range(3)),
         'voltage': _u16(frame, 20) / 1000.0,
     }
+
+
+# ---- 19 字节超声波帧 ----
+#
+# 固件每拍在 24 字节底盘帧后面紧跟一帧：头 0xFA、8 路 int16 大端（mm）、
+# BCC、尾 0xFC。0 表示这一路没有读数（没装模块，或者 CAN 上没收到）。
+
+DIST_HEADER = 0xFA
+DIST_TAIL = 0xFC
+DIST_SLOTS = 8
+DIST_BCC_LEN = 17
+
+
+class DistanceParser:
+    """19 字节超声波帧的滚动缓冲解析器。
+
+    和 UplinkParser 同一个套路，只是头尾不同。两帧在字节流里交错出现，
+    各扫各的，谁也不影响谁。
+    """
+
+    def __init__(self):
+        self._buf = bytearray()
+        self.dropped = 0
+
+    def feed(self, chunk):
+        self._buf += chunk
+        out = []
+        while True:
+            i = self._buf.find(DIST_HEADER)
+            if i < 0:
+                self._buf.clear()
+                break
+            if i:
+                del self._buf[:i]
+            if len(self._buf) < DIST_LEN:
+                break
+            if (self._buf[DIST_LEN - 1] == DIST_TAIL
+                    and bcc(self._buf, DIST_BCC_LEN) == self._buf[DIST_LEN - 2]):
+                out.append(bytes(self._buf[:DIST_LEN]))
+                del self._buf[:DIST_LEN]
+            else:
+                self.dropped += 1
+                del self._buf[:1]
+        return out
+
+
+def parse_distance(frame):
+    """19 字节超声波帧 → 8 个距离，单位 mm。0 = 这一路没有读数。"""
+    return [_i16(frame, 1 + 2 * i) for i in range(DIST_SLOTS)]
+
 
 
 class Mahony:

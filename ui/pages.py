@@ -58,7 +58,7 @@ class PagesMixin:
         self.btn_selftest = QPushButton("整机自检"); self.btn_mow = QPushButton("开始割草"); self.btn_follow = QPushButton("雷达跟随"); self.btn_dock = QPushButton("自动回充"); self.btn_stop = QPushButton("紧急停止"); self.btn_release = QPushButton("解除急停"); self.btn_release.setEnabled(False)
         for btn in [self.btn_selftest, self.btn_mow, self.btn_follow, self.btn_dock, self.btn_stop, self.btn_release]:
             btn.setMinimumHeight(40); btn.setStyleSheet("font-size:20px;"); left_layout.addWidget(btn)
-        # 急停是锁存的（固件 uartx_callback.c:138），不解就是复位前一直停着 ——
+        # 急停是锁存的（固件 app/chassis.c 的 ESTOP），不解就是复位前一直停着 ——
         # 所以解除必须是主界面上一个够显眼的按钮，不能藏进菜单。
         self.btn_release.setStyleSheet("font-size:20px; background-color:#1e6b3b; color:white;")
         self.btn_stop.setStyleSheet("font-size:20px; font-weight:bold; background-color:#c0392b; color:white;")

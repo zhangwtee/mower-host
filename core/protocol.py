@@ -4,7 +4,7 @@
 真正过串口的是桥 `bridge/mower_bridge/protocol.py`，**那份是权威实现**（含收帧解析），
 改协议时两边要一起改。
 
-字段对照固件 lawn-mower/BALANCE/uartx_callback.c 的分支，没有的别加。
+字段对照固件 mower-chassis/app/protocol.c 的分支，没有的别加。
 """
 
 

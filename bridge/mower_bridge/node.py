@@ -1,20 +1,22 @@
-"""chassis_bridge —— 底盘串口桥，mower-host 独占这个串口。
+"""底盘串口桥。mower-host 里只有这个进程碰串口。
 
-收发全包：订阅语义话题 → 组 11 字节帧 → 写串口；读串口 → 解 24 字节帧 →
-发 /odom /imu/data_raw /PowerVoltage。
+收：24 字节底盘帧 → /odom /imu/data_raw /PowerVoltage，19 字节超声波帧 → /ultrasonic_mm
+发：/cmd_vel 这类语义话题 → 11 字节帧
 
-三件不能省的事：
-  * 帧同步用滚动缓冲 + 帧尾/BCC 双校验。固件吐的字节流里每个 0x7B 前面是
-    0xFC，任何要求"前一字节是帧尾"的判据都会一帧都解不出来
-    （见 protocol.UplinkParser 的说明）。
-  * **带 cmd_vel 超时看门狗**。固件侧没有可用的指令丢失保护：一旦停发速度
-    指令，底盘会继续按最后一次速度跑。这个兜底只能放在桥里——所有速度指令
-    都要经过这里写串口。
-  * 不写 TF。odom_combined → base_footprint 由 ekf_node 出（publish_tf: true）。
-  * **急停锁存 + 命令确认都在这里做**。固件的 emergency_stop 在 SelfTest_Run()
-    里立刻清零、不锁存，CMD=8 也没有对应分支；上行帧里也没有 ACK 位。
-    所以锁存由桥维护（锁存期间丢弃 /cmd_vel 并补零速），确认则靠上行帧里
-    编码器实测的速度去"看效果"，结果发到 /cmd_ack。
+几件踩过的事，动之前先看一眼：
+
+帧同步得用滚动缓冲，别指望"前一字节是帧尾"。固件每个周期发的是 24 字节底盘帧
+紧跟 19 字节超声波帧，下一帧的 0x7B 前面是 0xFC，那种判据一帧都解不出来。
+细节在 protocol.UplinkParser 的注释里。
+
+cmd_vel 超时看门狗是我们自己加的。固件那边也有 500ms 的指令年龄超时，两边叠着，
+谁先到谁停。桥这道不能省——nav 停了但桥还活着，固件是看不见的。
+
+急停两边都锁存。固件收 CMD=7 进 ESTOP 并锁住，桥这边也锁，锁存期间不发速度。
+解除要发 CMD=8，固件还要求使能开关在位，开关没合上会静默失败，所以发完要盯着
+FlagStop 有没有回 0。
+
+TF 不归我们写，odom_combined → base_footprint 由 ekf_node 出。
 """
 import json
 import math
@@ -28,10 +30,10 @@ from rclpy.qos import QoSProfile, QoSDurabilityPolicy, ReliabilityPolicy
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Imu
-from std_msgs.msg import Float32, Int16, Empty, String, Bool
+from std_msgs.msg import Float32, Int16, Empty, String, Bool, Int16MultiArray
 
 from .protocol import (
-    Mahony, UplinkParser, parse_uplink,
+    Mahony, UplinkParser, DistanceParser, parse_uplink, parse_distance,
     build_vel_frame, build_servo_frame, build_selftest_frame,
     build_emergency_frame, build_release_frame,
 )
@@ -63,9 +65,12 @@ _COV_TWIST_MOVING = [1e-3, 0, 0, 0, 0, 0,
                      0, 0, 0, 0, 1e6, 0,
                      0, 0, 0, 0, 0, 1e3]
 
-# 固件上电后 uartx_callback.c:186 会丢掉 CONTROL_DELAY 之内的所有命令，
-# Time_count 在 100 Hz 的 balance_task 里自增，CONTROL_DELAY=1000 → 10 秒。
-BOOT_SILENCE_SEC = 10.0
+# 固件上电后要等两段才接受指令：
+#   1. 静默期 10 秒（固件 app/chassis_safety.h 的 SAFETY_BOOT_MS=10000）
+#   2. 开机自检 4.2 秒（SELFTEST_ON_BOOT=1，20+60+60+60+200+20 拍）
+# 合计 14.2 秒。等 10 秒就开始发，后面 4.2 秒的指令会被固件丢掉，
+# 而桥的 ACK 逻辑会把它当成"指令没生效"，白报一次失败。
+BOOT_SILENCE_SEC = 15.0
 
 
 class ChassisBridge(Node):
@@ -101,7 +106,8 @@ class ChassisBridge(Node):
 
         self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
         self.imu_pub = self.create_publisher(Imu, '/imu/data_raw', 10)
-        self.volt_pub = self.create_publisher(Float32, '/PowerVoltage', 10)
+
+
         self.ack_pub = self.create_publisher(String, '/cmd_ack', 10)
         # 锁存状态用 latched 发布：界面上半路重启时也能立刻知道"现在是急停中"
         self.estop_pub = self.create_publisher(
@@ -116,7 +122,8 @@ class ChassisBridge(Node):
         self.create_subscription(Twist, '/cmd_vel', self._on_cmd_vel, 10)
         self.create_subscription(Empty, '/soft_stop', self._on_soft_stop, 10)
 
-        self._parser = UplinkParser()
+
+
         self._q = queue.Queue(maxsize=200)
         self._ahrs = Mahony()
         self._lock = threading.Lock()
@@ -125,7 +132,7 @@ class ChassisBridge(Node):
         self._last_cmd = None
         self._stopped = False
         self._volt_count = 0
-        self._estop = False          # 桥自己的急停锁存（固件那份不锁存）
+        self._estop = False          # 桥自己的急停锁存；固件也锁存，两道叠着
         self._pending = None         # 待确认命令
         self._last_ack = 0.0
         self._last_zero = 0.0
@@ -171,11 +178,17 @@ class ChassisBridge(Node):
                 break
             if not chunk:
                 continue
+            # 两种帧各扫各的，一起进队列；出队时按类型分发
             for frame in self._parser.feed(chunk):
                 try:
-                    self._q.put_nowait(frame)
+                    self._q.put_nowait(('c', frame))
                 except queue.Full:
                     pass        # 队列满就丢帧，宁可少一帧也不拖住串口线程
+            for dframe in self._dist_parser.feed(chunk):
+                try:
+                    self._q.put_nowait(('d', dframe))
+                except queue.Full:
+                    pass
 
     def _write(self, frame):
         with self._lock:
@@ -189,10 +202,19 @@ class ChassisBridge(Node):
     def _drain(self):
         while True:
             try:
-                frame = self._q.get_nowait()
+                kind, frame = self._q.get_nowait()
             except queue.Empty:
                 return
-            self._on_frame(frame)
+            if kind == 'd':
+                self._on_dist_frame(frame)
+            else:
+                self._on_frame(frame)
+
+    def _on_dist_frame(self, frame):
+        """8 路超声波距离，单位 mm。0 = 这一路没有读数（没装模块或 CAN 没收到）。"""
+        m = Int16MultiArray()
+        m.data = parse_distance(frame)
+        self.dist_pub.publish(m)
 
     def _on_frame(self, frame):
         d = parse_uplink(frame)
@@ -319,7 +341,7 @@ class ChassisBridge(Node):
 
     def _on_selftest(self, msg):
         self._write(build_selftest_frame())
-        # 固件自检第一拍会设 Vx=0.3（SelfTest_Run），所以"动不动"可以观测
+        # 自检 0.2 秒后车会以 0.15 m/s 动起来，所以"动不动"可以观测
         self._selftest_watch = {'t0': time.monotonic()}
 
     def _check_selftest(self):
@@ -350,9 +372,9 @@ class ChassisBridge(Node):
     def _on_release(self, msg):
         self._set_estop(False)
         self._write(build_release_frame())
-        self._pending = None
-        # 固件没有 CMD=8 分支，这里解除的是"桥的锁存"；帧发出去只是留痕
-        self._ack('release', True, 0, 'latch_cleared')
+        # 固件侧的 ESTOP 是锁存的：收到 CMD=8 并且使能开关在位才会退出。
+        # 开关没合上时解除会静默失败，所以这里挂一个确认。
+        self._pending = {'cmd': 'release', 't0': time.monotonic(), 'hits': 0}
 
     # ---- 命令确认（观察效果，不是帧级回执） ----
 
@@ -397,6 +419,20 @@ class ChassisBridge(Node):
                 p['hits'] = 0
                 if t - p['t0'] > self.ack_timeout_estop:
                     self._ack('estop', False, elapsed, 'still_moving')
+                    self._pending = None
+        elif p['cmd'] == 'release':
+            # 固件退出 ESTOP 之后 FlagStop 会回 0。一直是 1 说明没解除。
+            if d['flag_stop'] == 0:
+                p['hits'] += 1
+                if p['hits'] >= self.ack_frames:
+                    self._ack('release', True, elapsed, 'latch_cleared')
+                    self._pending = None
+            else:
+                p['hits'] = 0
+                if t - p['t0'] > self.ack_timeout_estop:
+                    self._ack('release', False, elapsed, 'still_latched')
+                    self.get_logger().warning(
+                        '解除急停没有生效：底盘还是失能状态，检查使能开关是否合上')
                     self._pending = None
 
     # ---- 看门狗 ----
