@@ -106,4 +106,4 @@ ros2 topic echo /odom                          # 往 /dev/pts/4 灌帧，看有�
 
 [LICENSE](LICENSE)：MIT。
 
-上位机和下位机是两个仓库，这份只有上位机。下位机固件（`mower-chassis`）已经重写完成，但还没在实机上跑过，等验证完再发布。
+上位机和下位机是两个仓库，这份只有上位机。下位机固件在 [mower-chassis](../mower-chassis) 仓库。
