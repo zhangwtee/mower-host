@@ -1,7 +1,7 @@
 """11 字节发帧（上位机 → STM32）。
 
 这里只组帧、不解析 —— Ros2Client 把帧再解回语义话题，所以这份帧不会真的过串口。
-真正过串口的是桥 `bridge/mower_bridge/protocol.py`，**那份是权威实现**（含收帧解析），
+真正过串口的是桥 `bridge/mower_bridge/protocol.py`，**那份是完整实现**（含收帧解析），
 改协议时两边要一起改。
 
 字段对照固件 mower-chassis/app/protocol.c 的分支，没有的别加。
